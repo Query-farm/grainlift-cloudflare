@@ -30,7 +30,7 @@
   "observability": { "enabled": true },
   "env": {
     // `wrangler deploy --env public`: the same gateway on its own copy of the
-    // data, open to anyone (no sign-in) and read-only.
+    // data, open to anyone (no sign-in). Set READ_ONLY to refuse writes.
     "public": {
       "name": "grainlift-d1-public",
       "d1_databases": [
@@ -48,8 +48,7 @@
       "vars": {
         "PUBLIC_URL": "https://grainlift-d1-public.rusty-bb6.workers.dev",
         "CORS_ORIGIN": "https://cupola.query-farm.services",
-        "ALLOW_ANONYMOUS": "true",
-        "READ_ONLY": "true"
+        "ALLOW_ANONYMOUS": "true"
       }
     }
   }
