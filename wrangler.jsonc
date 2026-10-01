@@ -23,7 +23,9 @@
     "CORS_ORIGIN": "https://cupola.query-farm.services",
     // Google sign-in (see README). The GOOGLE_CLIENT_SECRET secret and the
     // ALLOWED_EMAILS / ALLOWED_DOMAINS allowlist (secrets here, or vars) complete it.
-    "GOOGLE_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com"
+    "GOOGLE_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com",
+    // The device-flow client for command-line sign-in (secret: GOOGLE_DEVICE_CLIENT_SECRET).
+    "GOOGLE_DEVICE_CLIENT_ID": "639014129284-qrj9d9ph9ohjcek7foauf71rsbpu7tb0.apps.googleusercontent.com"
   },
   "observability": { "enabled": true }
 }

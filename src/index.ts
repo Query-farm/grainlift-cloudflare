@@ -33,6 +33,10 @@ export interface Env {
   GOOGLE_CLIENT_ID?: string;
   /** Google OAuth client secret (`wrangler secret put GOOGLE_CLIENT_SECRET`). */
   GOOGLE_CLIENT_SECRET?: string;
+  /** Google "TVs and Limited Input devices" client for command-line (device flow) sign-in. */
+  GOOGLE_DEVICE_CLIENT_ID?: string;
+  /** Its secret (`wrangler secret put GOOGLE_DEVICE_CLIENT_SECRET`). */
+  GOOGLE_DEVICE_CLIENT_SECRET?: string;
   /** Comma-separated emails allowed to sign in with Google. */
   ALLOWED_EMAILS?: string;
   /** Comma-separated Google Workspace domains allowed to sign in. */
@@ -68,7 +72,7 @@ function authenticator(env: Env): AuthenticateFn {
     : null;
   const google = env.GOOGLE_CLIENT_ID
     ? googleIdTokenAuthenticate({
-        clientId: env.GOOGLE_CLIENT_ID,
+        clientIds: [env.GOOGLE_CLIENT_ID, env.GOOGLE_DEVICE_CLIENT_ID ?? ""],
         allowedEmails: list(env.ALLOWED_EMAILS),
         allowedDomains: list(env.ALLOWED_DOMAINS),
       })
@@ -105,6 +109,14 @@ function httpOptions(env: Env): HttpOptions {
       clientSecret: env.GOOGLE_CLIENT_SECRET,
       useIdTokenAsBearer: true,
       scopesSupported: ["openid", "email", "profile"],
+      // Google's device flow needs its own client type; the driver uses it on
+      // headless machines (and its secret, as Google requires one).
+      ...(env.GOOGLE_DEVICE_CLIENT_ID
+        ? {
+            deviceCodeClientId: env.GOOGLE_DEVICE_CLIENT_ID,
+            deviceCodeClientSecret: env.GOOGLE_DEVICE_CLIENT_SECRET,
+          }
+        : {}),
     };
   }
   return options;

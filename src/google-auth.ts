@@ -14,8 +14,9 @@ const LEEWAY_SECONDS = 60;
 const UNKNOWN_KEY_REFRESH_MS = 60_000;
 
 export interface GoogleAuthOptions {
-  /** The OAuth client ID tokens must be issued to (the `aud` claim). */
-  clientId: string;
+  /** OAuth client IDs tokens may be issued to (the `aud` claim): the browser
+   *  client and, for command-line sign-in, the device-flow client. */
+  clientIds: readonly string[];
   /** Email addresses allowed in. */
   allowedEmails?: readonly string[];
   /** Google Workspace domains (the `hd` claim) allowed in. */
@@ -34,14 +35,15 @@ interface Jwk extends JsonWebKey {
 export function googleIdTokenAuthenticate(options: GoogleAuthOptions): AuthenticateFn {
   const emails = new Set(options.allowedEmails?.map((e) => e.trim().toLowerCase()).filter(Boolean));
   const domains = new Set(options.allowedDomains?.map((d) => d.trim().toLowerCase()).filter(Boolean));
-  if (!options.clientId) throw new Error("googleIdTokenAuthenticate needs a client ID");
+  const audiences = new Set(options.clientIds.filter(Boolean));
+  if (!audiences.size) throw new Error("googleIdTokenAuthenticate needs a client ID");
   if (!emails.size && !domains.size) throw new Error("Allow at least one email or Workspace domain");
   const keys = new GoogleKeys();
 
   return async (request) => {
     const header = request.headers.get("authorization");
     if (!header?.startsWith("Bearer ")) return AuthContext.anonymous();
-    const claims = await verify(header.slice(7), options.clientId, keys);
+    const claims = await verify(header.slice(7), audiences, keys);
     const email = typeof claims.email === "string" ? claims.email.toLowerCase() : null;
     if (!email || claims.email_verified !== true) throw new Error("Token has no verified email");
     const domain = typeof claims.hd === "string" ? claims.hd.toLowerCase() : null;
@@ -50,7 +52,7 @@ export function googleIdTokenAuthenticate(options: GoogleAuthOptions): Authentic
   };
 }
 
-async function verify(token: string, clientId: string, keys: GoogleKeys): Promise<Record<string, unknown>> {
+async function verify(token: string, audiences: ReadonlySet<string>, keys: GoogleKeys): Promise<Record<string, unknown>> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Malformed token");
   const [headerPart, payloadPart, signaturePart] = parts as [string, string, string];
@@ -67,7 +69,7 @@ async function verify(token: string, clientId: string, keys: GoogleKeys): Promis
   const claims = JSON.parse(decodeText(payloadPart)) as Record<string, unknown>;
   const now = Date.now() / 1000;
   if (!GOOGLE_ISSUERS.has(claims.iss as string)) throw new Error("Wrong issuer");
-  if (claims.aud !== clientId) throw new Error("Wrong audience");
+  if (typeof claims.aud !== "string" || !audiences.has(claims.aud)) throw new Error("Wrong audience");
   if (typeof claims.exp !== "number" || claims.exp + LEEWAY_SECONDS < now) throw new Error("Token expired");
   if (typeof claims.iat === "number" && claims.iat - LEEWAY_SECONDS > now) throw new Error("Token not yet valid");
   return claims;

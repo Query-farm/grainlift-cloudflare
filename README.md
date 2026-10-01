@@ -66,6 +66,11 @@ working alongside it.
    list out of the repository (`npx wrangler secret put ALLOWED_EMAILS`).
    Nobody else gets in.
 3. `npx wrangler secret put GOOGLE_CLIENT_SECRET`, then `npm run deploy`.
+4. For command-line sign-in (the Grainlift driver's device flow), create a
+   second client of type **TVs and Limited Input devices** in the same
+   project. Set `GOOGLE_DEVICE_CLIENT_ID` and
+   `npx wrangler secret put GOOGLE_DEVICE_CLIENT_SECRET`. The gateway accepts
+   ID tokens issued to either client.
 
 Google's access tokens are opaque, so clients send the ID token
 (`use_id_token_as_bearer`). Google requires the client secret even for PKCE.
