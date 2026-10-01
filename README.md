@@ -61,8 +61,10 @@ working alongside it.
    - Authorized JavaScript origins: `https://cupola.query-farm.services`
    - Authorized redirect URIs: `https://cupola.query-farm.services/oauth-callback.html`
      and `https://<your-worker>/_oauth/callback`
-2. In `wrangler.jsonc` `vars`, set `GOOGLE_CLIENT_ID`, plus `ALLOWED_EMAILS`
-   and/or `ALLOWED_DOMAINS` (comma-separated). Nobody else gets in.
+2. In `wrangler.jsonc` `vars`, set `GOOGLE_CLIENT_ID`. Set `ALLOWED_EMAILS`
+   and/or `ALLOWED_DOMAINS` (comma-separated) as vars, or as secrets to keep the
+   list out of the repository (`npx wrangler secret put ALLOWED_EMAILS`).
+   Nobody else gets in.
 3. `npx wrangler secret put GOOGLE_CLIENT_SECRET`, then `npm run deploy`.
 
 Google's access tokens are opaque, so clients send the ID token

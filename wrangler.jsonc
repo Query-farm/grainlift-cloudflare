@@ -20,9 +20,10 @@
   "vars": {
     "PUBLIC_URL": "https://grainlift-d1-example.rusty-bb6.workers.dev",
     // Cupola, the browser client allowed to call the gateway.
-    "CORS_ORIGIN": "https://cupola.query-farm.services"
-    // Google sign-in (see README): GOOGLE_CLIENT_ID plus ALLOWED_EMAILS and/or
-    // ALLOWED_DOMAINS here, and the GOOGLE_CLIENT_SECRET secret.
+    "CORS_ORIGIN": "https://cupola.query-farm.services",
+    // Google sign-in (see README). The GOOGLE_CLIENT_SECRET secret and the
+    // ALLOWED_EMAILS / ALLOWED_DOMAINS allowlist (secrets here, or vars) complete it.
+    "GOOGLE_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com"
   },
   "observability": { "enabled": true }
 }
