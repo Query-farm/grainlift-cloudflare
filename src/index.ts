@@ -13,6 +13,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   AuthContext,
   type AuthenticateFn,
+  authenticateAnonymous,
   bearerAuthenticateStatic,
   GrainliftService,
   type HttpOptions,
@@ -41,6 +42,10 @@ export interface Env {
   ALLOWED_EMAILS?: string;
   /** Comma-separated Google Workspace domains allowed to sign in. */
   ALLOWED_DOMAINS?: string;
+  /** "true": requests without credentials are allowed, as principal "anonymous". */
+  ALLOW_ANONYMOUS?: string;
+  /** "true": refuse writes (for a gateway anyone may query). */
+  READ_ONLY?: string;
 }
 
 /** The server-side target name clients ATTACH with (`target 'd1'`). */
@@ -51,7 +56,7 @@ export class GrainliftGateway extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const service = new GrainliftService(new D1Worker(env.DB), {
+    const service = new GrainliftService(new D1Worker(env.DB, { readOnly: env.READ_ONLY === "true" }), {
       authorize: (_principal, target) => target === TARGET,
       // Clients that go away without closing (a reloaded browser tab, a killed
       // process) hold sessions until they idle out; keep that window short.
@@ -77,6 +82,13 @@ function authenticator(env: Env): AuthenticateFn {
         allowedDomains: list(env.ALLOWED_DOMAINS),
       })
     : null;
+  if (env.ALLOW_ANONYMOUS === "true") {
+    // Credentials are optional; a presented token must still be valid.
+    return authenticateAnonymous("anonymous", async (request) => {
+      const identity = token ? await token(request) : AuthContext.anonymous();
+      return identity.authenticated || !google ? identity : google(request);
+    });
+  }
   if (!token && !google) throw new Error("Set GRAINLIFT_TOKEN or configure Google sign-in");
   return async (request) => {
     const identity = token ? await token(request) : AuthContext.anonymous();

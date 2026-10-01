@@ -48,20 +48,31 @@ type SqlValue = string | number | null | ArrayBuffer;
 // Arrow type ids (Arrow FlatBuffer `Type`), shared by both Arrow backends.
 const TypeId = { Int: 2, Float: 3, Binary: 4, Utf8: 5, Bool: 6, Decimal: 7, Date: 8, Timestamp: 10 } as const;
 
+export interface D1Options {
+  /** Refuse writes: for a gateway anyone may query. */
+  readOnly?: boolean;
+}
+
 export class D1Worker implements Worker {
-  constructor(private readonly db: D1Database) {}
+  constructor(
+    private readonly db: D1Database,
+    private readonly options: D1Options = {},
+  ) {}
   async open(_options: OpenOptions): Promise<Connection> {
-    return new D1Connection(this.db);
+    return new D1Connection(this.db, this.options);
   }
 }
 
 class D1Connection extends Connection {
-  constructor(private readonly db: D1Database) {
+  constructor(
+    private readonly db: D1Database,
+    private readonly options: D1Options,
+  ) {
     super();
   }
 
   override async newStatement(): Promise<Statement> {
-    return new D1Statement(this.db);
+    return new D1Statement(this.db, this.options);
   }
 
   // D1 has no interactive transactions: every statement autocommits.
@@ -186,7 +197,10 @@ class D1Statement extends Statement {
   private bound: { schema: Schema; rows: SqlValue[][] } | null = null;
   private readonly ingest = new Map<string, string>();
 
-  constructor(private readonly db: D1Database) {
+  constructor(
+    private readonly db: D1Database,
+    private readonly options: D1Options,
+  ) {
     super();
   }
 
@@ -214,6 +228,7 @@ class D1Statement extends Statement {
   }
 
   override async execute(): Promise<QueryResult> {
+    if (this.options.readOnly) refuseWrites(this.query());
     const rows = this.bound?.rows ?? [[]];
     if (rows.length !== 1) throw new AdbcError("Queries take at most one row of parameters", "invalid_arguments");
     const [names, ...values] = await this.db
@@ -228,6 +243,7 @@ class D1Statement extends Statement {
   }
 
   override async executeUpdate(): Promise<bigint | null> {
+    if (this.options.readOnly) throw new AdbcError("This gateway is read-only", "unauthorized");
     if (this.ingest.has("adbc.ingest.target_table")) return this.ingestBound();
     const sql = this.query();
     const rows = this.bound?.rows ?? [[]];
@@ -275,6 +291,17 @@ class D1Statement extends Statement {
 }
 
 // ----- helpers ---------------------------------------------------------------
+
+/**
+ * D1 has no read-only connections, so a read-only gateway only runs queries
+ * that start as reads and name no statement that writes. Conservative: a
+ * write keyword anywhere (even inside a string) is refused.
+ */
+function refuseWrites(sql: string): void {
+  const reads = /^\s*(select|with|values|explain)\b/i.test(sql);
+  const writes = /\b(insert|update|delete|replace|create|drop|alter|attach|detach|pragma|vacuum|reindex|analyze)\b/i.test(sql);
+  if (!reads || writes) throw new AdbcError("This gateway is read-only", "unauthorized");
+}
 
 function result(value: Schema, batches: RecordBatch[]): QueryResult {
   return { schema: value, batches };

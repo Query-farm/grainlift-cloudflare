@@ -49,6 +49,30 @@ Set `PUBLIC_URL` (and `CORS_ORIGIN`, for a browser client) in
 and run `npm run db:migrate:local && npm run dev`. The local URI is then
 `grainlift+http://127.0.0.1:8787`.
 
+## A public, read-only gateway
+
+`wrangler.jsonc` also defines a `public` environment: the same gateway on its
+own copy of the data (a second D1 database), open to anyone without sign-in
+(`ALLOW_ANONYMOUS`) and read-only (`READ_ONLY`). It is deployed at
+`https://grainlift-d1-public.rusty-bb6.workers.dev`:
+
+```sql
+ATTACH 'grainlift+https://grainlift-d1-public.rusty-bb6.workers.dev' AS d1 (TYPE grainlift, target 'd1');
+```
+
+or in Cupola:
+<https://cupola.query-farm.services/?service=grainlift%2Bhttps://grainlift-d1-public.rusty-bb6.workers.dev&target=d1>
+
+```sh
+npx wrangler d1 create grainlift-example-public   # its database_id goes in env.public
+npx wrangler d1 migrations apply grainlift-example-public --remote --env public
+npx wrangler deploy --env public
+```
+
+D1 has no read-only connections, so read-only mode only runs statements that
+begin as reads (`SELECT`, `WITH`, `VALUES`, `EXPLAIN`) and contain no
+write keyword. It refuses ingestion and `execute_update` outright.
+
 ## Google sign-in
 
 With Google configured, the gateway accepts Google ID tokens from allowed
