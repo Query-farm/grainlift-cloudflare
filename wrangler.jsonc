@@ -1,0 +1,28 @@
+{
+  // A Grainlift ADBC gateway serving a D1 database. See README.md.
+  "name": "grainlift-d1-example",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  // AsyncLocalStorage, node:crypto and Buffer, used by @query-farm/grainlift.
+  "compatibility_flags": ["nodejs_compat"],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "grainlift-example",
+      "database_id": "f2cfe241-6b87-4665-b83e-e7d06f8d3994",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "GATEWAY", "class_name": "GrainliftGateway" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] }],
+  "vars": {
+    "PUBLIC_URL": "https://grainlift-d1-example.rusty-bb6.workers.dev",
+    // Cupola, the browser client allowed to call the gateway.
+    "CORS_ORIGIN": "https://cupola.query-farm.services"
+    // Google sign-in (see README): GOOGLE_CLIENT_ID plus ALLOWED_EMAILS and/or
+    // ALLOWED_DOMAINS here, and the GOOGLE_CLIENT_SECRET secret.
+  },
+  "observability": { "enabled": true }
+}

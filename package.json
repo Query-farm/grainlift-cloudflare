@@ -1,0 +1,24 @@
+{
+  "name": "grainlift-typescript-cloudflare-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A Grainlift ADBC gateway on Cloudflare Workers serving a D1 database",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply grainlift-example --local",
+    "db:migrate": "wrangler d1 migrations apply grainlift-example --remote",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@query-farm/grainlift": "github:Query-farm/grainlift-typescript#8b1a0962c25eab188ad4bbf892f16ca09fec190a"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260930.2",
+    "typescript": "5.9.3",
+    "wrangler": "^4.145.0"
+  }
+}
