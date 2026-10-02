@@ -2,13 +2,44 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // The two places the gateway keeps a SQLite database.
-import { AdbcError } from "@query-farm/grainlift";
+import { AdbcError, type Status } from "@query-farm/grainlift";
 import type { SqlStore, SqlValue, SqlWrite } from "./sqlite";
+
+/**
+ * The service hides every error that is not an AdbcError ("Worker operation
+ * failed"), so pass the database's own message on: SQL mistakes, constraint
+ * violations and the store's size limits are the user's to see.
+ */
+async function surfaced<T>(store: string, action: () => T | Promise<T>): Promise<T> {
+  try {
+    return await action();
+  } catch (error) {
+    if (error instanceof AdbcError) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const status: Status = /constraint/i.test(message)
+      ? "integrity"
+      : /syntax|no such|SQLITE_ERROR|SQLITE_RANGE|datatype mismatch/i.test(message)
+        ? "invalid_arguments"
+        : "io";
+    throw new AdbcError(`${store}: ${message}`, status);
+  }
+}
+
+/** Below D1's 32 MiB limit on one call's serialized arguments, for overhead. */
+const MAX_D1_BATCH_BYTES = 30 * 2 ** 20;
+
+function paramBytes(value: SqlValue): number {
+  if (value === null) return 1;
+  if (typeof value === "number") return 8;
+  if (typeof value === "string") return value.length;
+  return value.byteLength;
+}
 
 /**
  * Cloudflare D1. A write is one `db.batch()`, which D1 runs as a transaction,
  * so it lands whole or not at all; every statement in it counts toward D1's
- * queries-per-request limit (1,000 on Workers Paid, 50 on Free).
+ * queries-per-request limit (1,000 on Workers Paid, 50 on Free), and the batch
+ * as a whole must serialize to at most 32 MiB.
  */
 export class D1Store implements SqlStore {
   readonly name = "D1";
@@ -19,20 +50,17 @@ export class D1Store implements SqlStore {
   ) {}
 
   async rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }> {
-    const [columns, ...rows] = await this.db
-      .prepare(sql)
-      .bind(...params)
-      .raw<unknown[]>({ columnNames: true });
-    return { columns: (columns ?? []) as unknown as string[], rows };
+    return surfaced(this.name, async () => {
+      const [columns, ...rows] = await this.db
+        .prepare(sql)
+        .bind(...params)
+        .raw<unknown[]>({ columnNames: true });
+      return { columns: (columns ?? []) as unknown as string[], rows };
+    });
   }
 
   async objects<T>(sql: string, params: SqlValue[]): Promise<T[]> {
-    return (
-      await this.db
-        .prepare(sql)
-        .bind(...params)
-        .all<T>()
-    ).results;
+    return surfaced(this.name, async () => (await this.db.prepare(sql).bind(...params).all<T>()).results);
   }
 
   async write(statements: SqlWrite[]): Promise<number> {
@@ -44,7 +72,18 @@ export class D1Store implements SqlStore {
         "invalid_arguments",
       );
     }
-    const done = await this.db.batch(statements.map((s) => this.db.prepare(s.sql).bind(...s.params)));
+    // D1 limits one call's serialized arguments to 32 MiB; refuse before sending.
+    const bytes = statements.reduce((n, s) => n + s.sql.length + s.params.reduce<number>((m, p) => m + paramBytes(p), 0), 0);
+    if (bytes > MAX_D1_BATCH_BYTES) {
+      throw new AdbcError(
+        `This write is about ${Math.round(bytes / 2 ** 20)} MiB; D1 accepts at most 32 MiB in one request, ` +
+          "so insert it in smaller parts (or use the sqlite target)",
+        "invalid_arguments",
+      );
+    }
+    const done = await surfaced(this.name, () =>
+      this.db.batch(statements.map((s) => this.db.prepare(s.sql).bind(...s.params))),
+    );
     return done.reduce((changes, result) => changes + (result.meta.changes ?? 0), 0);
   }
 }
@@ -59,13 +98,15 @@ export class DurableSqlStore implements SqlStore {
   constructor(private readonly storage: DurableObjectStorage) {}
 
   async rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }> {
-    const cursor = this.storage.sql.exec(sql, ...params);
-    const rows = [...cursor.raw()];
-    return { columns: cursor.columnNames, rows };
+    return surfaced(this.name, () => {
+      const cursor = this.storage.sql.exec(sql, ...params);
+      const rows = [...cursor.raw()];
+      return { columns: cursor.columnNames, rows };
+    });
   }
 
   async objects<T>(sql: string, params: SqlValue[]): Promise<T[]> {
-    return this.storage.sql.exec(sql, ...params).toArray() as T[];
+    return surfaced(this.name, () => this.storage.sql.exec(sql, ...params).toArray() as T[]);
   }
 
   async write(statements: SqlWrite[]): Promise<number> {
@@ -73,10 +114,12 @@ export class DurableSqlStore implements SqlStore {
     // total_changes() counts rows changed by INSERT/UPDATE/DELETE only, so DDL
     // in the batch does not distort the count (changes() would be stale).
     const total = () => Number(sql.exec("SELECT total_changes() AS n").one().n);
-    return this.storage.transactionSync(() => {
-      const before = total();
-      for (const statement of statements) sql.exec(statement.sql, ...statement.params);
-      return total() - before;
-    });
+    return surfaced(this.name, () =>
+      this.storage.transactionSync(() => {
+        const before = total();
+        for (const statement of statements) sql.exec(statement.sql, ...statement.params);
+        return total() - before;
+      }),
+    );
   }
 }

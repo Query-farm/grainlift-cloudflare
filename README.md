@@ -116,12 +116,12 @@ backend sends its `CREATE`/`DROP` and every row in one transaction (multi-row
 
 - **`sqlite`:** one `transactionSync`, with no per-request query limit. The
   gateway holds the whole upload in memory first (64 MB / 1,024 Arrow batches
-  by default).
+  by default); 60 MB inserts are tested.
 - **`d1`:** one `db.batch()`, which D1 runs as a transaction. Every statement
   counts toward D1's limit of 1,000 queries per request (50 on the Free plan;
   set `D1_MAX_QUERIES`). That is about 1,000 × (100 ÷ columns) rows: 50,000
-  for a 2-column table, 14,000 for `cities`. A larger insert is refused before
-  anything is written.
+  for a 2-column table, 14,000 for `cities`. D1 also caps one batch at 32 MiB
+  of data. A larger insert is refused before anything is written.
 
 Neither store keeps a transaction open across requests, so DuckDB's
 `BEGIN … COMMIT` around several writes is refused.
