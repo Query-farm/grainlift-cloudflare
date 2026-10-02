@@ -73,8 +73,10 @@ export class GrainliftGateway extends DurableObject<Env> {
       // Clients that go away without closing (a reloaded browser tab, a killed
       // process) hold sessions until they idle out; keep that window short.
       limits: {
-        sessions: 256,
-        sessionsPerPrincipal: 64,
+        sessions: 1024,
+        // Every anonymous client shares the one "anonymous" principal, so a
+        // per-principal cap would be a cap on the whole public gateway.
+        sessionsPerPrincipal: env.ALLOW_ANONYMOUS === "true" ? 1024 : 64,
         idleMs: 120_000,
         ...(env.REQUEST_BYTES ? { requestBytes: Number(env.REQUEST_BYTES) } : {}),
       },
