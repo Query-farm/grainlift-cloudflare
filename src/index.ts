@@ -18,8 +18,10 @@ import {
   GrainliftService,
   type HttpOptions,
 } from "@query-farm/grainlift";
-import { D1Worker } from "./d1";
 import { googleIdTokenAuthenticate } from "./google-auth";
+import SAMPLE_DATA from "../migrations/0001_sample_data.sql";
+import { type SqlStore, SqliteWorker } from "./sqlite";
+import { D1Store, DurableSqlStore } from "./stores";
 
 export interface Env {
   DB: D1Database;
@@ -46,18 +48,26 @@ export interface Env {
   ALLOW_ANONYMOUS?: string;
   /** "true": refuse writes (for a gateway anyone may query). */
   READ_ONLY?: string;
+  /** D1's queries per request: 1000 on Workers Paid, 50 on Free. */
+  D1_MAX_QUERIES?: string;
 }
-
-/** The server-side target name clients ATTACH with (`target 'd1'`). */
-const TARGET = "d1";
 
 export class GrainliftGateway extends DurableObject<Env> {
   private readonly handler: (request: Request) => Promise<Response>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const service = new GrainliftService(new D1Worker(env.DB, { readOnly: env.READ_ONLY === "true" }), {
-      authorize: (_principal, target) => target === TARGET,
+    // Two targets, the same SQLite backend over two stores: `d1` (Cloudflare
+    // D1) and `sqlite` (this Durable Object's own storage, seeded with the
+    // sample tables on first start).
+    const stores = new Map<string, SqlStore>([
+      ["d1", new D1Store(env.DB, Number(env.D1_MAX_QUERIES ?? 1000))],
+      ["sqlite", new DurableSqlStore(ctx.storage)],
+    ]);
+    void ctx.blockConcurrencyWhile(() => seed(ctx.storage));
+    const worker = new SqliteWorker(stores, { readOnly: env.READ_ONLY === "true" });
+    const service = new GrainliftService(worker, {
+      authorize: (_principal, target) => stores.has(target),
       // Clients that go away without closing (a reloaded browser tab, a killed
       // process) hold sessions until they idle out; keep that window short.
       limits: { sessions: 256, sessionsPerPrincipal: 64, idleMs: 120_000 },
@@ -68,6 +78,13 @@ export class GrainliftGateway extends DurableObject<Env> {
   override async fetch(request: Request): Promise<Response> {
     return this.handler(request);
   }
+}
+
+/** Load the sample tables into the Durable Object's SQLite, once. */
+async function seed(storage: DurableObjectStorage): Promise<void> {
+  if (await storage.get("seeded")) return;
+  storage.transactionSync(() => storage.sql.exec(SAMPLE_DATA));
+  await storage.put("seeded", true);
 }
 
 /** The static token (if set) and Google ID tokens (if configured). */
@@ -155,10 +172,13 @@ function landingPage(url: URL): Response {
 <style>body{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:3rem auto;padding:0 1rem}code,pre{background:#f4f4f4;border-radius:4px}pre{padding:1rem;overflow-x:auto}</style>
 </head><body>
 <h1>Grainlift D1 gateway</h1>
-<p>An ADBC gateway serving a Cloudflare D1 database, written with the
+<p>An ADBC gateway serving SQLite databases, written with the
 <a href="https://github.com/Query-farm/grainlift-typescript">Grainlift TypeScript SDK</a>.
-Attach it from DuckDB with the grainlift extension:</p>
-<pre>ATTACH '${uri}' AS d1 (TYPE grainlift, target '${TARGET}', bearer_token '…');
+Two targets: <code>d1</code> (a Cloudflare D1 database) and <code>sqlite</code>
+(this gateway's own Durable Object storage). Attach one from DuckDB with the
+grainlift extension:</p>
+<pre>ATTACH '${uri}' AS d1 (TYPE grainlift, target 'd1');
+ATTACH '${uri}' AS local (TYPE grainlift, target 'sqlite');
 SELECT * FROM d1.countries;</pre>
 </body></html>`;
   return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });

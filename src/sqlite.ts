@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Query Farm LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// A Grainlift backend over Cloudflare D1 (SQLite). SQL passes straight through
-// to D1; metadata comes from sqlite_master and the table_info/foreign_key_list
-// pragmas, laid out like the ADBC SQLite driver's (catalog "main", one unnamed
-// schema), so DuckDB's ATTACH browses and writes it the same way.
+// A Grainlift backend over SQLite, stored in Cloudflare D1 or in a Durable
+// Object (see SqlStore). SQL passes straight through; metadata comes from
+// sqlite_master and the table_info/foreign_key_list pragmas, laid out like the
+// ADBC SQLite driver's (catalog "main", one unnamed schema), so DuckDB's ATTACH
+// browses and writes it the same way.
 import {
   AdbcError,
   batch,
@@ -40,45 +41,67 @@ const CATALOG = "main";
 /** SQLite has no schemas; ADBC's SQLite driver reports one unnamed schema. */
 const DB_SCHEMA = "";
 const ROWS_PER_BATCH = 4096;
-/** Rows per D1 batch() call when binding parameters or ingesting. */
-const ROWS_PER_WRITE = 500;
+/** Bound parameters per statement: D1's limit, and Durable Object SQLite's. */
+const MAX_PARAMETERS = 100;
 
-type SqlValue = string | number | null | ArrayBuffer;
+export type SqlValue = string | number | null | ArrayBuffer;
+
+/** One statement of an atomic write. */
+export interface SqlWrite {
+  sql: string;
+  params: SqlValue[];
+}
+
+/** Where the SQLite database lives. */
+export interface SqlStore {
+  /** For messages: "D1", "Durable Object SQLite". */
+  readonly name: string;
+  /** Run a query: its column names and rows of values. */
+  rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }>;
+  /** Run a query: rows as objects keyed by column name. */
+  objects<T>(sql: string, params: SqlValue[]): Promise<T[]>;
+  /** Run the statements as one transaction (all or nothing); rows changed. */
+  write(statements: SqlWrite[]): Promise<number>;
+}
 
 // Arrow type ids (Arrow FlatBuffer `Type`), shared by both Arrow backends.
 const TypeId = { Int: 2, Float: 3, Binary: 4, Utf8: 5, Bool: 6, Decimal: 7, Date: 8, Timestamp: 10 } as const;
 
-export interface D1Options {
+export interface SqliteOptions {
   /** Refuse writes: for a gateway anyone may query. */
   readOnly?: boolean;
 }
 
-export class D1Worker implements Worker {
+/** Serves each target from its store; unknown targets are refused. */
+export class SqliteWorker implements Worker {
   constructor(
-    private readonly db: D1Database,
-    private readonly options: D1Options = {},
+    private readonly stores: ReadonlyMap<string, SqlStore>,
+    private readonly options: SqliteOptions = {},
   ) {}
-  async open(_options: OpenOptions): Promise<Connection> {
-    return new D1Connection(this.db, this.options);
+  async open(options: OpenOptions): Promise<Connection> {
+    const store = this.stores.get(options.target);
+    if (!store) throw new AdbcError(`Unknown target ${options.target}`, "not_found");
+    return new SqliteConnection(store, this.options);
   }
 }
 
-class D1Connection extends Connection {
+class SqliteConnection extends Connection {
   constructor(
-    private readonly db: D1Database,
-    private readonly options: D1Options,
+    private readonly store: SqlStore,
+    private readonly options: SqliteOptions,
   ) {
     super();
   }
 
   override async newStatement(): Promise<Statement> {
-    return new D1Statement(this.db, this.options);
+    return new SqliteStatement(this.store, this.options);
   }
 
-  // D1 has no interactive transactions: every statement autocommits.
+  // No transaction stays open across requests (neither store allows one), so
+  // every statement autocommits; each one is atomic on its own.
   override async setOption(key: string, value: OptionValue): Promise<void> {
     if (key === "adbc.connection.autocommit" && value === "true") return;
-    throw new AdbcError(`${key} is not supported by D1`, "not_implemented");
+    throw new AdbcError(`${key} is not supported by ${this.store.name}`, "not_implemented");
   }
 
   override async getTableTypes(): Promise<QueryResult> {
@@ -87,7 +110,7 @@ class D1Connection extends Connection {
 
   override async getTableSchema(table: TableIdentifier): Promise<Schema> {
     checkLocation(table.catalog, table.db_schema);
-    const columns = await tableInfo(this.db, table.table_name);
+    const columns = await tableInfo(this.store, table.table_name);
     if (!columns.length) throw new AdbcError(`Table ${table.table_name} does not exist`, "not_found");
     return schema(columns.map((c) => field(c.name, declaredType(c.type), c.notnull === 0)));
   }
@@ -111,13 +134,12 @@ class D1Connection extends Connection {
 
   private async tables(filters: ObjectFilters, withColumns: boolean): Promise<TableRow[]> {
     const types = filters.table_types?.map((t) => t.toLowerCase());
-    const { results } = await this.db
-      .prepare(
-        `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')
-           AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
-           AND name NOT LIKE 'd1\\_%' ESCAPE '\\' ORDER BY name`,
-      )
-      .all<{ name: string; type: string }>();
+    const results = await this.store.objects<{ name: string; type: string }>(
+      `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')
+         AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
+         AND name NOT LIKE 'd1\\_%' ESCAPE '\\' ORDER BY name`,
+      [],
+    );
     const rows: TableRow[] = [];
     for (const { name, type } of results) {
       if (!likeMatches(filters.table_name, name) || (types && !types.includes(type))) continue;
@@ -132,7 +154,7 @@ class D1Connection extends Connection {
   }
 
   private async columns(table: string, pattern: string | null): Promise<ColumnRow[]> {
-    return (await tableInfo(this.db, table))
+    return (await tableInfo(this.store, table))
       .filter((c) => likeMatches(pattern, c.name))
       .map((c) => ({
         column_name: c.name,
@@ -159,7 +181,7 @@ class D1Connection extends Connection {
 
   private async constraints(table: string): Promise<ConstraintRow[]> {
     const constraints: ConstraintRow[] = [];
-    const key = (await tableInfo(this.db, table)).filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
+    const key = (await tableInfo(this.store, table)).filter((c) => c.pk > 0).sort((a, b) => a.pk - b.pk);
     if (key.length) {
       constraints.push({
         constraint_name: null,
@@ -168,10 +190,15 @@ class D1Connection extends Connection {
         constraint_column_usage: [],
       });
     }
-    const { results } = await this.db
-      .prepare(`SELECT id, seq, "table" AS target, "from" AS source, "to" AS referenced FROM pragma_foreign_key_list(?)`)
-      .bind(table)
-      .all<{ id: number; seq: number; target: string; source: string; referenced: string | null }>();
+    const results = await this.store.objects<{
+      id: number;
+      seq: number;
+      target: string;
+      source: string;
+      referenced: string | null;
+    }>(`SELECT id, seq, "table" AS target, "from" AS source, "to" AS referenced FROM pragma_foreign_key_list(?)`, [
+      table,
+    ]);
     const byId = new Map<number, typeof results>();
     for (const row of results) byId.set(row.id, [...(byId.get(row.id) ?? []), row]);
     for (const rows of byId.values()) {
@@ -192,14 +219,14 @@ class D1Connection extends Connection {
   }
 }
 
-class D1Statement extends Statement {
+class SqliteStatement extends Statement {
   private sql: string | null = null;
   private bound: { schema: Schema; rows: SqlValue[][] } | null = null;
   private readonly ingest = new Map<string, string>();
 
   constructor(
-    private readonly db: D1Database,
-    private readonly options: D1Options,
+    private readonly store: SqlStore,
+    private readonly options: SqliteOptions,
   ) {
     super();
   }
@@ -215,7 +242,7 @@ class D1Statement extends Statement {
 
   override async setOption(key: string, value: OptionValue): Promise<void> {
     if (!key.startsWith("adbc.ingest.") || typeof value !== "string")
-      throw new AdbcError(`${key} is not supported by D1`, "not_implemented");
+      throw new AdbcError(`${key} is not supported by ${this.store.name}`, "not_implemented");
     this.ingest.set(key, value);
   }
 
@@ -231,11 +258,8 @@ class D1Statement extends Statement {
     if (this.options.readOnly) refuseWrites(this.query());
     const rows = this.bound?.rows ?? [[]];
     if (rows.length !== 1) throw new AdbcError("Queries take at most one row of parameters", "invalid_arguments");
-    const [names, ...values] = await this.db
-      .prepare(this.query())
-      .bind(...rows[0]!)
-      .raw<unknown[]>({ columnNames: true });
-    return queryResult((names ?? []) as unknown as string[], values);
+    const { columns, rows: values } = await this.store.rows(this.query(), rows[0]!);
+    return queryResult(columns, values);
   }
 
   override async executeSchema(): Promise<Schema> {
@@ -245,21 +269,21 @@ class D1Statement extends Statement {
   override async executeUpdate(): Promise<bigint | null> {
     if (this.options.readOnly) throw new AdbcError("This gateway is read-only", "unauthorized");
     if (this.ingest.has("adbc.ingest.target_table")) return this.ingestBound();
+    // One statement per row of parameters, all in one transaction.
     const sql = this.query();
     const rows = this.bound?.rows ?? [[]];
-    let changes = 0;
-    for (let i = 0; i < rows.length; i += ROWS_PER_WRITE) {
-      const statements = rows.slice(i, i + ROWS_PER_WRITE).map((row) => this.db.prepare(sql).bind(...row));
-      for (const done of await this.db.batch(statements)) changes += done.meta.changes ?? 0;
-    }
-    return BigInt(changes);
+    return BigInt(await this.store.write(rows.map((params) => ({ sql, params }))));
   }
 
-  /** ADBC bulk ingestion: create (per mode) and append the bound rows. */
+  /**
+   * ADBC bulk ingestion: create (per mode) and append the bound rows, in one
+   * transaction, so a DuckDB INSERT or CREATE TABLE AS lands whole or not at
+   * all. Rows go in multi-row INSERTs as large as the parameter limit allows.
+   */
   private async ingestBound(): Promise<bigint> {
     const table = this.ingest.get("adbc.ingest.target_table")!;
     const target = this.ingest.get("adbc.ingest.target_db_schema");
-    if (target && target !== "main") throw new AdbcError("D1 has no schemas", "not_found");
+    if (target && target !== "main") throw new AdbcError(`${this.store.name} has no schemas`, "not_found");
     if (!this.bound) throw new AdbcError("Ingestion requires bound data", "invalid_state");
     const mode = this.ingest.get("adbc.ingest.mode") ?? "adbc.ingest.mode.create";
     const { schema: bound, rows } = this.bound;
@@ -271,17 +295,21 @@ class D1Statement extends Statement {
       setup.push(`CREATE TABLE ${name} (${columns})`);
     else if (mode === "adbc.ingest.mode.create_append") setup.push(`CREATE TABLE IF NOT EXISTS ${name} (${columns})`);
     else if (mode !== "adbc.ingest.mode.append") throw new AdbcError(`Unknown ingestion mode ${mode}`, "invalid_arguments");
-    for (const sql of setup) await this.db.prepare(sql).run();
-    if (!rows.length) return 0n;
-    const insert = `INSERT INTO ${name} (${bound.fields.map((f) => quote(f.name)).join(", ")}) VALUES (${bound.fields
-      .map(() => "?")
-      .join(", ")})`;
-    let changes = 0;
-    for (let i = 0; i < rows.length; i += ROWS_PER_WRITE) {
-      const statements = rows.slice(i, i + ROWS_PER_WRITE).map((row) => this.db.prepare(insert).bind(...row));
-      for (const done of await this.db.batch(statements)) changes += done.meta.changes ?? 0;
+    const width = bound.fields.length;
+    if (width > MAX_PARAMETERS)
+      throw new AdbcError(`${this.store.name} binds at most ${MAX_PARAMETERS} columns per row`, "invalid_arguments");
+    const perStatement = Math.max(1, Math.floor(MAX_PARAMETERS / Math.max(width, 1)));
+    const head = `INSERT INTO ${name} (${bound.fields.map((f) => quote(f.name)).join(", ")}) VALUES `;
+    const tuple = `(${bound.fields.map(() => "?").join(", ")})`;
+    const statements: SqlWrite[] = setup.map((sql) => ({ sql, params: [] }));
+    for (let i = 0; i < rows.length; i += perStatement) {
+      const chunk = rows.slice(i, i + perStatement);
+      statements.push({ sql: head + chunk.map(() => tuple).join(", "), params: chunk.flat() });
     }
-    return BigInt(changes);
+    // The transaction inserted every row or none; per-statement change counts
+    // can be stale after DROP/CREATE, so report the rows themselves.
+    await this.store.write(statements);
+    return BigInt(rows.length);
   }
 
   private query(): string {
@@ -316,17 +344,16 @@ interface ColumnInfo {
   pk: number;
 }
 
-async function tableInfo(db: D1Database, table: string): Promise<ColumnInfo[]> {
-  const { results } = await db
-    .prepare("SELECT cid, name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?) ORDER BY cid")
-    .bind(table)
-    .all<ColumnInfo>();
-  return results;
+async function tableInfo(store: SqlStore, table: string): Promise<ColumnInfo[]> {
+  return store.objects<ColumnInfo>(
+    'SELECT cid, name, type, "notnull", dflt_value, pk FROM pragma_table_info(?) ORDER BY cid',
+    [table],
+  );
 }
 
 function checkLocation(catalog: string | null, dbSchema: string | null): void {
   if ((catalog && catalog !== CATALOG) || (dbSchema && dbSchema !== DB_SCHEMA && dbSchema !== "main"))
-    throw new AdbcError("D1 has one catalog (main) and no schemas", "not_found");
+    throw new AdbcError("SQLite has one catalog (main) and no schemas", "not_found");
 }
 
 /** ADBC filters are SQL LIKE patterns (% and _); null matches everything. */
@@ -374,7 +401,7 @@ function sqliteType(type: DataType): string {
   }
 }
 
-/** Arrow values as D1 parameters. */
+/** Arrow values as SQLite parameters. */
 function rowsOf(value: RecordBatch): SqlValue[][] {
   const columns = value.schema.fields.map((f, i) => ({ type: f.type, column: value.getChildAt(i) }));
   const rows: SqlValue[][] = [];
@@ -407,8 +434,9 @@ function toSql(value: unknown, type: DataType): SqlValue {
 }
 
 /**
- * Arrow columns for D1's untyped rows: integers become int64, other numbers
- * float64, blobs binary, anything else text. A column with only NULLs is text.
+ * Arrow columns for untyped result rows (neither store reports column types):
+ * integers become int64, other numbers float64, blobs binary, anything else
+ * text. A column with only NULLs is text.
  */
 function queryResult(columnNames: string[], rows: unknown[][]): QueryResult {
   // Arrow allows duplicate names, but batches are built by name: number repeats.

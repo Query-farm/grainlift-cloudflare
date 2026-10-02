@@ -5,6 +5,8 @@
   "compatibility_date": "2025-09-01",
   // AsyncLocalStorage, node:crypto and Buffer, used by @query-farm/grainlift.
   "compatibility_flags": ["nodejs_compat"],
+  // The sample-data migration is also bundled, to seed the `sqlite` target.
+  "rules": [{ "type": "Text", "globs": ["**/*.sql"], "fallthrough": true }],
   "d1_databases": [
     {
       "binding": "DB",

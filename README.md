@@ -23,11 +23,16 @@ GROUP BY ALL;
   Durable Object is the one place on Workers where they reliably do. When the
   object is evicted after idling, its sessions end; the driver opens a new one
   for the next query.
-- `src/d1.ts`: the backend. SQL passes straight through to D1. Tables,
-  columns, primary keys and foreign keys come from `sqlite_master` and the
-  table pragmas, laid out like the ADBC SQLite driver's (catalog `main`, one
-  unnamed schema). ADBC bulk ingestion creates and appends to tables, so DuckDB
-  can `CREATE TABLE … AS` and `INSERT` through `ATTACH`.
+- `src/sqlite.ts`: the backend, for any SQLite store. SQL passes straight
+  through. Tables, columns, primary keys and foreign keys come from
+  `sqlite_master` and the table pragmas, laid out like the ADBC SQLite
+  driver's (catalog `main`, one unnamed schema). ADBC bulk ingestion creates
+  and appends to tables, so DuckDB can `CREATE TABLE … AS` and `INSERT` through
+  `ATTACH`.
+- `src/stores.ts`: the two stores, one per target:
+  - `target 'd1'`: a Cloudflare D1 database.
+  - `target 'sqlite'`: the gateway Durable Object's own SQLite storage, seeded
+    with the sample tables on first start.
 - `src/google-auth.ts`: optional Google sign-in (see below).
 - `migrations/`: sample `countries` and `cities` tables (rounded figures).
 
@@ -103,12 +108,28 @@ Token requests therefore go through the gateway's `/_oauth/token` proxy,
 which adds it. As with VGI services, VGI-RPC also lists the secret in the
 OAuth metadata.
 
+## Writes are atomic per statement
+
+Each DuckDB `INSERT` or `CREATE TABLE … AS` lands whole or not at all. The
+backend sends its `CREATE`/`DROP` and every row in one transaction (multi-row
+`INSERT`s, up to the 100 bound parameters per statement both stores allow).
+
+- **`sqlite`:** one `transactionSync`, with no per-request query limit. The
+  gateway holds the whole upload in memory first (64 MB / 1,024 Arrow batches
+  by default).
+- **`d1`:** one `db.batch()`, which D1 runs as a transaction. Every statement
+  counts toward D1's limit of 1,000 queries per request (50 on the Free plan;
+  set `D1_MAX_QUERIES`). That is about 1,000 × (100 ÷ columns) rows: 50,000
+  for a 2-column table, 14,000 for `cities`. A larger insert is refused before
+  anything is written.
+
+Neither store keeps a transaction open across requests, so DuckDB's
+`BEGIN … COMMIT` around several writes is refused.
+
 ## Limitations
 
-- D1 results are untyped JSON. A query's column types are inferred from its
-  values (integers, floats, text, blobs). Table scans through `ATTACH` use the
+- Neither store reports result column types. A query's column types are
+  inferred from its values (integers, floats, text, blobs). Table scans through `ATTACH` use the
   declared column types; the grainlift extension casts the results to them.
-- D1 has no interactive transactions. Each statement commits on its own, and
-  `BEGIN … COMMIT` around writes through `ATTACH` fails.
 - `GetInfo` is not implemented. The extension then uses standard SQL for filter
   pushdown.
