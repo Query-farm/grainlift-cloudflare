@@ -56,6 +56,8 @@ export interface SqlWrite {
 export interface SqlStore {
   /** For messages: "D1", "Durable Object SQLite". */
   readonly name: string;
+  /** The largest row the store accepts, in bytes of bound values. */
+  readonly maxRowBytes: number;
   /** Run a query: its column names and rows of values. */
   rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }>;
   /** Run a query: rows as objects keyed by column name. */
@@ -268,6 +270,7 @@ class SqliteStatement extends Statement {
 
   override async executeUpdate(): Promise<bigint | null> {
     if (this.options.readOnly) throw new AdbcError("This gateway is read-only", "unauthorized");
+    if (this.bound) checkRowSizes(this.store, this.bound.rows);
     if (this.ingest.has("adbc.ingest.target_table")) return this.ingestBound();
     // One statement per row of parameters, all in one transaction.
     const sql = this.query();
@@ -399,6 +402,31 @@ function sqliteType(type: DataType): string {
     default:
       return "TEXT";
   }
+}
+
+/** Bytes a bound value occupies in a row (close to SQLite's record size). */
+export function paramBytes(value: SqlValue): number {
+  if (value === null) return 1;
+  if (typeof value === "number") return 8;
+  if (typeof value === "string") return value.length;
+  return value.byteLength;
+}
+
+/**
+ * Refuse a row the store would reject (SQLITE_TOOBIG), before writing
+ * anything, and say which row and why.
+ */
+function checkRowSizes(store: SqlStore, rows: readonly SqlValue[][]): void {
+  rows.forEach((row, index) => {
+    const bytes = row.reduce<number>((total, value) => total + paramBytes(value), 0);
+    if (bytes > store.maxRowBytes) {
+      throw new AdbcError(
+        `Row ${index + 1} is ${(bytes / 2 ** 20).toFixed(1)} MiB; ${store.name} stores at most ` +
+          `${store.maxRowBytes / 2 ** 20} MiB per row`,
+        "invalid_arguments",
+      );
+    }
+  });
 }
 
 /** Arrow values as SQLite parameters. */

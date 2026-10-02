@@ -50,6 +50,8 @@ export interface Env {
   READ_ONLY?: string;
   /** D1's queries per request: 1000 on Workers Paid, 50 on Free. */
   D1_MAX_QUERIES?: string;
+  /** Largest HTTP request the gateway accepts, in bytes (SDK default 8 MiB). */
+  REQUEST_BYTES?: string;
 }
 
 export class GrainliftGateway extends DurableObject<Env> {
@@ -70,7 +72,12 @@ export class GrainliftGateway extends DurableObject<Env> {
       authorize: (_principal, target) => stores.has(target),
       // Clients that go away without closing (a reloaded browser tab, a killed
       // process) hold sessions until they idle out; keep that window short.
-      limits: { sessions: 256, sessionsPerPrincipal: 64, idleMs: 120_000 },
+      limits: {
+        sessions: 256,
+        sessionsPerPrincipal: 64,
+        idleMs: 120_000,
+        ...(env.REQUEST_BYTES ? { requestBytes: Number(env.REQUEST_BYTES) } : {}),
+      },
     });
     this.handler = service.httpHandler(authenticator(env), httpOptions(env));
   }

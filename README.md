@@ -123,6 +123,11 @@ backend sends its `CREATE`/`DROP` and every row in one transaction (multi-row
   for a 2-column table, 14,000 for `cities`. D1 also caps one batch at 32 MiB
   of data. A larger insert is refused before anything is written.
 
+Both stores reject a row larger than about 8 MiB (SQLite's `SQLITE_TOOBIG`;
+measured, while Cloudflare documents 2 MB), whether in one value or spread
+across several. The backend refuses such a row before writing, naming it.
+The gateway accepts requests up to 16 MiB (`REQUEST_BYTES`) so such a row fits.
+
 Neither store keeps a transaction open across requests, so DuckDB's
 `BEGIN … COMMIT` around several writes is refused.
 

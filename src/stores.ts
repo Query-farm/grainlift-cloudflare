@@ -3,7 +3,14 @@
 
 // The two places the gateway keeps a SQLite database.
 import { AdbcError, type Status } from "@query-farm/grainlift";
-import type { SqlStore, SqlValue, SqlWrite } from "./sqlite";
+import { paramBytes, type SqlStore, type SqlValue, type SqlWrite } from "./sqlite";
+
+/**
+ * Both stores reject a row (the sum of its values) larger than about 8 MiB
+ * with SQLITE_TOOBIG: measured, 8,388,609 bytes pass and 8,500,000 fail, in
+ * one value or split across two (Cloudflare documents 2 MB).
+ */
+const MAX_ROW_BYTES = 8 * 2 ** 20;
 
 /**
  * The service hides every error that is not an AdbcError ("Worker operation
@@ -28,13 +35,6 @@ async function surfaced<T>(store: string, action: () => T | Promise<T>): Promise
 /** Below D1's 32 MiB limit on one call's serialized arguments, for overhead. */
 const MAX_D1_BATCH_BYTES = 30 * 2 ** 20;
 
-function paramBytes(value: SqlValue): number {
-  if (value === null) return 1;
-  if (typeof value === "number") return 8;
-  if (typeof value === "string") return value.length;
-  return value.byteLength;
-}
-
 /**
  * Cloudflare D1. A write is one `db.batch()`, which D1 runs as a transaction,
  * so it lands whole or not at all; every statement in it counts toward D1's
@@ -43,6 +43,7 @@ function paramBytes(value: SqlValue): number {
  */
 export class D1Store implements SqlStore {
   readonly name = "D1";
+  readonly maxRowBytes = MAX_ROW_BYTES;
 
   constructor(
     private readonly db: D1Database,
@@ -94,6 +95,7 @@ export class D1Store implements SqlStore {
  */
 export class DurableSqlStore implements SqlStore {
   readonly name = "Durable Object SQLite";
+  readonly maxRowBytes = MAX_ROW_BYTES;
 
   constructor(private readonly storage: DurableObjectStorage) {}
 
