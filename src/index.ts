@@ -22,6 +22,7 @@ import { googleIdTokenAuthenticate } from "./google-auth";
 import SAMPLE_DATA from "../migrations/0001_sample_data.sql";
 import { type SqlStore, SqliteWorker } from "./sqlite";
 import { D1Store, DurableSqlStore } from "./stores";
+import { R2Uploads } from "./uploads";
 
 export interface Env {
   DB: D1Database;
@@ -52,6 +53,14 @@ export interface Env {
   D1_MAX_QUERIES?: string;
   /** Largest HTTP request the gateway accepts, in bytes (SDK default 8 MiB). */
   REQUEST_BYTES?: string;
+  /** Largest bound Arrow batch the gateway decodes, in bytes (SDK default 16 MiB). */
+  BATCH_BYTES?: string;
+  /** R2 bucket for externalized requests and responses (see src/uploads.ts). */
+  UPLOADS?: R2Bucket;
+  /** HMAC key signing upload URLs (`wrangler secret put UPLOAD_SIGNING_KEY`). */
+  UPLOAD_SIGNING_KEY?: string;
+  /** Largest externalized request a client may upload, in bytes. */
+  MAX_UPLOAD_BYTES?: string;
 }
 
 export class GrainliftGateway extends DurableObject<Env> {
@@ -79,6 +88,7 @@ export class GrainliftGateway extends DurableObject<Env> {
         sessionsPerPrincipal: env.ALLOW_ANONYMOUS === "true" ? 1024 : 64,
         idleMs: 120_000,
         ...(env.REQUEST_BYTES ? { requestBytes: Number(env.REQUEST_BYTES) } : {}),
+        ...(env.BATCH_BYTES ? { batchBytes: Number(env.BATCH_BYTES) } : {}),
       },
     });
     this.handler = service.httpHandler(authenticator(env), httpOptions(env));
@@ -130,8 +140,28 @@ function authenticator(env: Env): AuthenticateFn {
  * secret Google requires to token requests. (VGI-RPC also lists the secret in
  * the metadata, as for VGI services; Google treats it as low-sensitivity.)
  */
+/** Externalization, when the bucket, signing key and public URL are configured. */
+function uploads(env: Env): R2Uploads | null {
+  if (!env.UPLOADS || !env.UPLOAD_SIGNING_KEY || !env.PUBLIC_URL) return null;
+  return new R2Uploads(env.UPLOADS, env.UPLOAD_SIGNING_KEY, env.PUBLIC_URL, env.CORS_ORIGIN);
+}
+
 function httpOptions(env: Env): HttpOptions {
   const options: HttpOptions = {};
+  const externalized = uploads(env);
+  if (externalized && env.PUBLIC_URL) {
+    const origin = new URL(env.PUBLIC_URL).origin;
+    options.uploadUrlProvider = externalized.provider;
+    if (env.MAX_UPLOAD_BYTES) options.maxUploadBytes = Number(env.MAX_UPLOAD_BYTES);
+    options.externalLocation = {
+      storage: externalized.storage,
+      fetch: externalized.fetch,
+      // Pointers may only name this gateway's own upload URLs.
+      urlValidator: (url) => {
+        if (new URL(url).origin !== origin) throw new Error("External location is not this gateway");
+      },
+    };
+  }
   if (env.CORS_ORIGIN) {
     options.corsOrigins = env.CORS_ORIGIN;
     options.allowedReturnOrigins = new Set([env.CORS_ORIGIN]);
@@ -168,6 +198,9 @@ export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/") return landingPage(url);
+    // Upload URLs are served here, streaming to and from R2.
+    const upload = await uploads(env)?.handle(request);
+    if (upload) return upload;
     // One instance: every session must reach the same in-memory service.
     return env.GATEWAY.get(env.GATEWAY.idFromName("gateway")).fetch(request);
   },

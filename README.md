@@ -128,6 +128,25 @@ measured, while Cloudflare documents 2 MB), whether in one value or spread
 across several. The backend refuses such a row before writing, naming it.
 The gateway accepts requests up to 16 MiB (`REQUEST_BYTES`) so such a row fits.
 
+## Large requests and results go through R2
+
+A request bigger than `REQUEST_BYTES` is not split or refused: the client asks
+the gateway for an upload URL, PUTs the request there, and sends only a
+pointer (up to `MAX_UPLOAD_BYTES`, 64 MiB by default). Results over 1 MB come
+back the same way, as a URL the client fetches. The URLs point at the Worker
+itself (`/_uploads/<key>`), signed with HMAC-SHA256 and valid for 15 minutes;
+the Worker streams bodies to and from an R2 bucket through its binding, so no
+R2 credentials are involved ([`src/uploads.ts`](src/uploads.ts)).
+
+```sh
+npx wrangler r2 bucket create grainlift-example-uploads
+openssl rand -hex 32 | npx wrangler secret put UPLOAD_SIGNING_KEY
+```
+
+Add a lifecycle rule to the bucket to delete objects after a day; nothing else
+removes them. `CORS_ORIGIN` also applies to `/_uploads/`, so a browser client
+can PUT and GET there.
+
 Neither store keeps a transaction open across requests, so DuckDB's
 `BEGIN … COMMIT` around several writes is refused.
 

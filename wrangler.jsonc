@@ -19,12 +19,17 @@
     "bindings": [{ "name": "GATEWAY", "class_name": "GrainliftGateway" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] }],
+  // Externalized requests/responses (src/uploads.ts); objects expire after a day.
+  "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "grainlift-example-uploads" }],
   "vars": {
     "PUBLIC_URL": "https://grainlift-d1-example.rusty-bb6.workers.dev",
     // Cupola, the browser client allowed to call the gateway.
     "CORS_ORIGIN": "https://cupola.query-farm.services",
     // Requests up to 16 MiB, so a row near the stores' 8 MiB limit fits.
     "REQUEST_BYTES": "16777216",
+    // Larger requests go through upload URLs, up to a 64 MiB bound batch.
+    "BATCH_BYTES": "67108864",
+    "MAX_UPLOAD_BYTES": "67108864",
     // Google sign-in (see README). The GOOGLE_CLIENT_SECRET secret and the
     // ALLOWED_EMAILS / ALLOWED_DOMAINS allowlist (secrets here, or vars) complete it.
     "GOOGLE_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com",
@@ -49,11 +54,14 @@
         "bindings": [{ "name": "GATEWAY", "class_name": "GrainliftGateway" }]
       },
       "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] }],
+      "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "grainlift-example-uploads" }],
       "vars": {
         "PUBLIC_URL": "https://grainlift-d1-public.rusty-bb6.workers.dev",
         "CORS_ORIGIN": "https://cupola.query-farm.services",
         "ALLOW_ANONYMOUS": "true",
-        "REQUEST_BYTES": "16777216"
+        "REQUEST_BYTES": "16777216",
+        "BATCH_BYTES": "67108864",
+        "MAX_UPLOAD_BYTES": "67108864"
       }
     }
   }

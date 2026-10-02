@@ -14,7 +14,7 @@
     "types": "wrangler types"
   },
   "dependencies": {
-    "@query-farm/grainlift": "github:Query-farm/grainlift-typescript#3445305b48771d4d67b49a00c12799fcf8d65930"
+    "@query-farm/grainlift": "github:Query-farm/grainlift-typescript#90efed6486b85d119f24a0ffa27e4f3c40f4a35b"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260930.2",
