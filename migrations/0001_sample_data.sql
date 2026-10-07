@@ -1,4 +1,4 @@
--- Sample data for the Grainlift D1 gateway. Figures are rounded approximations
+-- Sample data for the Grainlift Cloudflare gateway. Figures are rounded approximations
 -- for demonstration, not authoritative statistics.
 
 CREATE TABLE countries (

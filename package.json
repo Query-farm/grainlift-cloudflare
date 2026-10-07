@@ -1,8 +1,8 @@
 {
-  "name": "grainlift-typescript-cloudflare-example",
+  "name": "grainlift-cloudflare",
   "version": "0.1.0",
   "private": true,
-  "description": "A Grainlift ADBC gateway on Cloudflare Workers serving a D1 database",
+  "description": "A Grainlift ADBC gateway on Cloudflare Workers for Durable Objects and D1 databases",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {

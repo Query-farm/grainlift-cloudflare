@@ -1,6 +1,6 @@
 {
-  // A Grainlift ADBC gateway serving a D1 database. See README.md.
-  "name": "grainlift-d1-example",
+  // A Grainlift ADBC gateway for Durable Objects and D1 databases. See README.md.
+  "name": "grainlift-cloudflare",
   "main": "src/index.ts",
   "compatibility_date": "2025-09-01",
   // AsyncLocalStorage, node:crypto and Buffer, used by @query-farm/grainlift.
@@ -16,13 +16,25 @@
     }
   ],
   "durable_objects": {
-    "bindings": [{ "name": "GATEWAY", "class_name": "GrainliftGateway" }]
+    "bindings": [
+      { "name": "GATEWAY", "class_name": "GrainliftGateway" },
+      // An example application object the durable_object target can query.
+      // To query another Worker's class, add "script_name": "<that worker>".
+      { "name": "ROOMS", "class_name": "ExampleRoom" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] },
+    { "tag": "v2", "new_sqlite_classes": ["ExampleRoom"] }
+  ],
   // Externalized requests/responses (src/uploads.ts); objects expire after a day.
   "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "grainlift-example-uploads" }],
   "vars": {
-    "PUBLIC_URL": "https://grainlift-d1-example.rusty-bb6.workers.dev",
+    "PUBLIC_URL": "https://grainlift-cloudflare.rusty-bb6.workers.dev",
+    // Durable Object bindings the durable_object target may query.
+    "DURABLE_OBJECT_NAMESPACES": "ROOMS",
+    // D1 bindings the d1 target may query.
+    "D1_DATABASES": "DB",
     // Cupola, the browser client allowed to call the gateway.
     "CORS_ORIGIN": "https://cupola.query-farm.services",
     // Requests up to 16 MiB, so a row near the stores' 8 MiB limit fits.
@@ -30,18 +42,21 @@
     // Larger requests go through upload URLs, up to a 64 MiB bound batch.
     "BATCH_BYTES": "67108864",
     "MAX_UPLOAD_BYTES": "67108864",
-    // Google sign-in (see README). The GOOGLE_CLIENT_SECRET secret and the
-    // ALLOWED_EMAILS / ALLOWED_DOMAINS allowlist (secrets here, or vars) complete it.
-    "GOOGLE_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com",
-    // The device-flow client for command-line sign-in (secret: GOOGLE_DEVICE_CLIENT_SECRET).
-    "GOOGLE_DEVICE_CLIENT_ID": "639014129284-qrj9d9ph9ohjcek7foauf71rsbpu7tb0.apps.googleusercontent.com"
+    // Sign-in with any OpenID Connect provider (see README, Sign-in); here
+    // Google. The OIDC_CLIENT_SECRET secret completes it. Who may use what
+    // is the PERMISSIONS secret (see README, Permissions).
+    "OIDC_ISSUER": "https://accounts.google.com",
+    "OIDC_CLIENT_ID": "639014129284-9kogcob2eedl4o2ualcakfgk5l24qqfe.apps.googleusercontent.com",
+    // Google's device-flow client, for command-line sign-in (secret: OIDC_DEVICE_CLIENT_SECRET).
+    "OIDC_DEVICE_CLIENT_ID": "639014129284-qrj9d9ph9ohjcek7foauf71rsbpu7tb0.apps.googleusercontent.com"
   },
   "observability": { "enabled": true },
   "env": {
     // `wrangler deploy --env public`: the same gateway on its own copy of the
-    // data, open to anyone (no sign-in). Set READ_ONLY to refuse writes.
+    // data, open to anyone (no sign-in): PERMISSIONS grants "anonymous"
+    // everything. Set READ_ONLY to refuse writes.
     "public": {
-      "name": "grainlift-d1-public",
+      "name": "grainlift-cloudflare-public",
       "d1_databases": [
         {
           "binding": "DB",
@@ -51,14 +66,23 @@
         }
       ],
       "durable_objects": {
-        "bindings": [{ "name": "GATEWAY", "class_name": "GrainliftGateway" }]
+        "bindings": [
+          { "name": "GATEWAY", "class_name": "GrainliftGateway" },
+          { "name": "ROOMS", "class_name": "ExampleRoom" }
+        ]
       },
-      "migrations": [{ "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] }],
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] },
+        { "tag": "v2", "new_sqlite_classes": ["ExampleRoom"] }
+      ],
       "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "grainlift-example-uploads" }],
       "vars": {
-        "PUBLIC_URL": "https://grainlift-d1-public.rusty-bb6.workers.dev",
+        "PUBLIC_URL": "https://grainlift-cloudflare-public.rusty-bb6.workers.dev",
+        "DURABLE_OBJECT_NAMESPACES": "ROOMS",
+        "D1_DATABASES": "DB",
         "CORS_ORIGIN": "https://cupola.query-farm.services",
         "ALLOW_ANONYMOUS": "true",
+        "PERMISSIONS": "{\"anonymous\": [{\"target\": \"*\", \"access\": \"read_write\"}]}",
         "REQUEST_BYTES": "16777216",
         "BATCH_BYTES": "67108864",
         "MAX_UPLOAD_BYTES": "67108864"
