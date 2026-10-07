@@ -166,6 +166,8 @@ class Session {
 }
 
 class SqliteConnection extends Connection {
+  override statisticsSupported(): boolean { return false; }
+  override statisticNamesSupported(): boolean { return false; }
   private readonly store: SqlStore;
 
   constructor(private readonly session: Session) {

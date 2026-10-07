@@ -11,13 +11,16 @@
     "db:migrate:local": "wrangler d1 migrations apply grainlift-example --local",
     "db:migrate": "wrangler d1 migrations apply grainlift-example --remote",
     "typecheck": "tsc --noEmit",
+    "test:blog-demo": "node tests/blog-demo.mjs",
     "types": "wrangler types"
   },
   "dependencies": {
-    "@query-farm/grainlift": "github:Query-farm/grainlift-typescript#871796926edae0301260ed8b850c779bc27b27d0"
+    "@query-farm/grainlift": "github:Query-farm/grainlift-typescript#0ea316b138e662bb2630a8b07fba68e97909a5ca"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260930.2",
+    "esbuild": "0.28.1",
+    "miniflare": "5.20261001.0-alpha",
     "typescript": "5.9.3",
     "wrangler": "^4.145.0"
   }

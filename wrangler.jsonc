@@ -57,8 +57,8 @@
   "observability": { "enabled": true },
   "env": {
     // `wrangler deploy --env public`: the same gateway on its own copy of the
-    // data, open to anyone (no sign-in): PERMISSIONS grants "anonymous"
-    // everything. Set READ_ONLY to refuse writes.
+    // data, open to anyone (no sign-in). The article's `demo` target points
+    // at a separate, fixed object that is erased and reseeded every four hours.
     "public": {
       "name": "grainlift-cloudflare-public",
       "d1_databases": [
@@ -72,21 +72,24 @@
       "durable_objects": {
         "bindings": [
           { "name": "GATEWAY", "class_name": "GrainliftGateway" },
-          { "name": "ROOMS", "class_name": "ExampleRoom" }
+          { "name": "ROOMS", "class_name": "ExampleRoom" },
+          { "name": "BLOG_DEMO", "class_name": "BlogDemo" }
         ]
       },
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["GrainliftGateway"] },
-        { "tag": "v2", "new_sqlite_classes": ["ExampleRoom"] }
+        { "tag": "v2", "new_sqlite_classes": ["ExampleRoom"] },
+        { "tag": "v3", "new_sqlite_classes": ["BlogDemo"] }
       ],
       "r2_buckets": [{ "binding": "UPLOADS", "bucket_name": "grainlift-example-uploads" }],
       "vars": {
         "PUBLIC_URL": "https://grainlift-cloudflare-public.rusty-bb6.workers.dev",
         "DURABLE_OBJECT_NAMESPACES": "ROOMS",
         "D1_DATABASES": "DB",
-        "CORS_ORIGIN": "https://cupola.query-farm.services",
+        // Anonymous sample data: usable in the article, Cupola and local previews.
+        "CORS_ORIGIN": "*",
         "ALLOW_ANONYMOUS": "true",
-        "PERMISSIONS": "{\"anonymous\": [{\"target\": \"*\", \"access\": \"read_write\"}]}",
+        "PERMISSIONS": "{\"anonymous\": [{\"target\": \"sqlite\", \"access\": \"read_write\"}, {\"target\": \"d1\", \"database\": \"DB\", \"access\": \"read_write\"}, {\"target\": \"durable_object\", \"namespace\": \"ROOMS\", \"access\": \"read_write\"}, {\"target\": \"durable_object\", \"namespace\": \"BLOG_DEMO\", \"object\": \"playground\", \"access\": \"read_write\"}, {\"target\": \"analytics_engine\"}]}",
         "REQUEST_BYTES": "16777216",
         "BATCH_BYTES": "67108864",
         "MAX_UPLOAD_BYTES": "67108864"

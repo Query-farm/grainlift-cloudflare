@@ -29,10 +29,12 @@ import { DURABLE_OBJECT_OPTIONS, durableObjectNamespaces, durableObjectStore } f
 import { oidcAuthenticate } from "./oidc-auth";
 import { Permissions, type Resource } from "./permissions";
 import { type SqlStore, SqliteWorker, type StoreSource } from "./sqlite";
-import { DurableSqlStore } from "./stores";
+import { DurableObjectStore, DurableSqlStore } from "./stores";
+import type { BlogDemo } from "./blog-demo";
 import { R2Uploads } from "./uploads";
 
 export { ExampleRoom } from "./example-room";
+export { BlogDemo } from "./blog-demo";
 export { GrainliftSqlObject } from "./grainlift-sql-object";
 
 export interface Env {
@@ -44,6 +46,8 @@ export interface Env {
    */
   D1_DATABASES?: string;
   GATEWAY: DurableObjectNamespace<GrainliftGateway>;
+  /** Optional fixed public playground; never exposed as an arbitrary namespace. */
+  BLOG_DEMO?: DurableObjectNamespace<BlogDemo>;
   /**
    * Comma-separated Durable Object bindings the `durable_object` target may
    * query, such as "ROOMS". Their classes must extend GrainliftSqlObject.
@@ -123,6 +127,14 @@ export class GrainliftGateway extends DurableObject<Env> {
     const stores = new Map<string, StoreSource>([
       ["sqlite", permitted(() => ({ store: own, resource: { target: "sqlite" } }), new Set())],
     ]);
+    // A short target also makes the same database directly linkable in Cupola.
+    // Its permission remains a grant for this one Durable Object, not a new
+    // permission type and not permission to create arbitrary named objects.
+    const demoResource: Resource = { target: "durable_object", namespace: "BLOG_DEMO", name: "playground" };
+    if (env.BLOG_DEMO) {
+      const demo = new DurableObjectStore("Blog demo", env.BLOG_DEMO.getByName("playground"));
+      stores.set("demo", permitted(() => ({ store: demo, resource: demoResource }), new Set()));
+    }
     const options = new Set<string>();
     const namespaces = durableObjectNamespaces(env, env.DURABLE_OBJECT_NAMESPACES);
     if (namespaces.size) {
@@ -157,7 +169,9 @@ export class GrainliftGateway extends DurableObject<Env> {
     };
     const targets = new Set([...stores.keys(), "analytics_engine"]);
     const service = new GrainliftService(worker, {
-      authorize: (principal, target) => targets.has(target) && permissions.allowsTarget(principal, target),
+      authorize: (principal, target) => targets.has(target) && (target === "demo"
+        ? permissions.access(principal, demoResource) !== null
+        : permissions.allowsTarget(principal, target)),
       allowedDatabaseOptions: options,
       // Autocommit off opens a transaction that commits as one atomic write.
       allowedConnectionOptions: new Set(["adbc.connection.autocommit"]),

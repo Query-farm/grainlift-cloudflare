@@ -267,6 +267,8 @@ function prepared(sql: string): string {
 }
 
 class AnalyticsConnection extends Connection {
+  override statisticsSupported(): boolean { return false; }
+  override statisticNamesSupported(): boolean { return false; }
   constructor(private readonly engine: AnalyticsEngine) {
     super();
   }

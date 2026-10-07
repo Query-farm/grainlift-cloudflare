@@ -33,6 +33,39 @@ The first three run the same SQLite backend: SQL passes straight through,
 DuckDB can browse, query, `CREATE TABLE … AS` and `INSERT`, and writes are
 atomic, including [transactions](#transactions).
 
+### Public article playground
+
+The `public` deployment also has a `demo` target: one fixed `BlogDemo` Durable
+Object, separate from both the gateway's storage and the existing example rooms.
+It contains synthetic coffee-shop `products`, `orders`, `visitor_notes`, and
+`demo_info` tables. No credentials are needed:
+
+```sql
+ATTACH 'grainlift+https://grainlift-cloudflare-public.rusty-bb6.workers.dev'
+  AS shop (TYPE grainlift, target 'demo');
+SELECT * FROM shop.products;
+```
+
+[Open the same database in Cupola](https://cupola.query-farm.services/?service=grainlift%2Bhttps%3A%2F%2Fgrainlift-cloudflare-public.rusty-bb6.workers.dev&target=demo&name=shop).
+Readers share the data and may write to it. An alarm erases **all** of the
+object's storage and reseeds it every four hours (00:00, 04:00, 08:00, 12:00,
+16:00, 20:00 UTC), including removing visitor-created tables. `demo_info` reports
+the next reset. The scheduling deadline lives outside the SQL tables; editing
+that table does not change the alarm. Construction also recovers an overdue
+reset. Repeated alarm delivery within a cycle preserves new writes.
+
+`BLOG_DEMO` is bound only in `env.public`. It is not listed in
+`DURABLE_OBJECT_NAMESPACES`, and clients cannot choose a different object through
+the `demo` target. Its permission is the existing Durable Object grant for
+namespace `BLOG_DEMO`, object `playground`. Public sample data uses wildcard CORS
+so both query.farm and Cupola (and local previews) can connect.
+
+Run `npm run typecheck` and `npm run test:blog-demo` before
+`npx wrangler deploy --env public`. The latter test uses local workerd SQLite to
+verify initialization, persistence across restarts, alarm deadlines, full
+cleanup, reseeding, and repeated alarm delivery. Its test-only reset methods
+are never included in the deployed Worker.
+
 ## How it works
 
 - `src/index.ts`: the Worker forwards every request to a single Durable
