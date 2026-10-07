@@ -35,6 +35,10 @@
     "DURABLE_OBJECT_NAMESPACES": "ROOMS",
     // D1 bindings the d1 target may query.
     "D1_DATABASES": "DB",
+    // The analytics_engine target: clients send cloudflare.account_id and
+    // cloudflare.api_token. To supply them for clients that send none, set
+    // this and the ANALYTICS_ENGINE_API_TOKEN secret (Account Analytics Read).
+    // "ANALYTICS_ENGINE_ACCOUNT_ID": "<32-hex-digit account ID>",
     // Cupola, the browser client allowed to call the gateway.
     "CORS_ORIGIN": "https://cupola.query-farm.services",
     // Requests up to 16 MiB, so a row near the stores' 8 MiB limit fits.

@@ -20,8 +20,10 @@ import {
   GrainliftService,
   type HttpOptions,
   type OpenOptions,
+  type Worker,
 } from "@query-farm/grainlift";
 import SAMPLE_DATA from "../migrations/0001_sample_data.sql";
+import { ANALYTICS_ENGINE_OPTIONS, analyticsEngineFor } from "./analytics-engine";
 import { D1_DATABASE_OPTION, d1Databases, d1Store } from "./d1";
 import { DURABLE_OBJECT_OPTIONS, durableObjectNamespaces, durableObjectStore } from "./durable-objects";
 import { oidcAuthenticate } from "./oidc-auth";
@@ -79,6 +81,16 @@ export interface Env {
   ALLOW_ANONYMOUS?: string;
   /** "true": refuse every write, whatever PERMISSIONS grants. */
   READ_ONLY?: string;
+  /**
+   * The account whose Workers Analytics Engine datasets the `analytics_engine`
+   * target queries, for clients that do not send `cloudflare.account_id`.
+   */
+  ANALYTICS_ENGINE_ACCOUNT_ID?: string;
+  /**
+   * An API token with Account Analytics Read, for clients that do not send
+   * `cloudflare.api_token` (`wrangler secret put ANALYTICS_ENGINE_API_TOKEN`).
+   */
+  ANALYTICS_ENGINE_API_TOKEN?: string;
   /** D1's queries per request: 1000 on Workers Paid, 50 on Free. */
   D1_MAX_QUERIES?: string;
   /** Largest HTTP request the gateway accepts, in bytes (SDK default 8 MiB). */
@@ -123,10 +135,29 @@ export class GrainliftGateway extends DurableObject<Env> {
       stores.set("d1", permitted((o) => d1Store(databases, maxQueries, o), new Set([D1_DATABASE_OPTION])));
       options.add(D1_DATABASE_OPTION);
     }
+    // `analytics_engine`: Workers Analytics Engine datasets, through the SQL
+    // API, with the client's account and token or the gateway's.
+    const engineDefaults = { accountId: env.ANALYTICS_ENGINE_ACCOUNT_ID, apiToken: env.ANALYTICS_ENGINE_API_TOKEN };
+    for (const key of ANALYTICS_ENGINE_OPTIONS) options.add(key);
     void ctx.blockConcurrencyWhile(() => seed(ctx.storage));
-    const worker = new SqliteWorker(stores);
+    const sqlite = new SqliteWorker(stores);
+    const worker: Worker = {
+      open: async (options) => {
+        if (options.target !== "analytics_engine") return sqlite.open(options);
+        for (const key of options.databaseOptions.keys()) {
+          if (!ANALYTICS_ENGINE_OPTIONS.has(key)) {
+            throw new AdbcError(`Target analytics_engine does not take the database option ${key}`, "invalid_arguments");
+          }
+        }
+        if (!permissions.access(options.principal, { target: "analytics_engine" })) {
+          throw new AdbcError("You do not have access to Analytics Engine", "unauthorized");
+        }
+        return analyticsEngineFor(options, engineDefaults).connect();
+      },
+    };
+    const targets = new Set([...stores.keys(), "analytics_engine"]);
     const service = new GrainliftService(worker, {
-      authorize: (principal, target) => stores.has(target) && permissions.allowsTarget(principal, target),
+      authorize: (principal, target) => targets.has(target) && permissions.allowsTarget(principal, target),
       allowedDatabaseOptions: options,
       // Autocommit off opens a transaction that commits as one atomic write.
       allowedConnectionOptions: new Set(["adbc.connection.autocommit"]),
@@ -307,8 +338,10 @@ function landingPage(url: URL): Response {
 Targets: <code>durable_object</code> (an object of a listed Durable Object
 namespace, chosen with the <code>cloudflare.durable_object.namespace</code> and
 <code>cloudflare.durable_object.name</code> options), <code>d1</code> (a listed
-D1 database, chosen with <code>cloudflare.d1.database</code>) and
-<code>sqlite</code> (this gateway's own Durable Object storage). Attach one from DuckDB
+D1 database, chosen with <code>cloudflare.d1.database</code>),
+<code>sqlite</code> (this gateway's own Durable Object storage) and
+<code>analytics_engine</code> (Workers Analytics Engine datasets, with
+<code>cloudflare.account_id</code> and <code>cloudflare.api_token</code>). Attach one from DuckDB
 with the grainlift extension:</p>
 <pre>ATTACH '${uri}' AS d1 (TYPE grainlift, target 'd1');
 ATTACH '${uri}' AS local (TYPE grainlift, target 'sqlite');

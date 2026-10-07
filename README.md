@@ -1,8 +1,9 @@
 # Grainlift on Cloudflare Workers
 
-An ADBC gateway for the SQLite databases inside your Cloudflare account: your
-Workers' [Durable Objects](https://developers.cloudflare.com/durable-objects/)
-and your [D1](https://developers.cloudflare.com/d1/) databases. It is written
+An ADBC gateway for the data inside your Cloudflare account: your Workers'
+[Durable Objects](https://developers.cloudflare.com/durable-objects/), your
+[D1](https://developers.cloudflare.com/d1/) databases, and the events your
+Workers record in [Workers Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/). It is written
 with the [Grainlift TypeScript SDK](https://github.com/Query-farm/grainlift-typescript)
 and runs as a Worker. Any ADBC client with the
 [Grainlift driver](https://github.com/Query-farm/grainlift) can query and
@@ -26,10 +27,11 @@ A client chooses a target, and within it a database, with ADBC options:
 | `durable_object` | One object of a Durable Object namespace bound to the gateway | `cloudflare.durable_object.namespace` and `.name` or `.id` (see [Query your own Durable Objects](#query-your-own-durable-objects)) |
 | `d1` | One D1 database bound to the gateway | `cloudflare.d1.database` (see [D1 databases](#d1-databases)) |
 | `sqlite` | The gateway's own Durable Object storage, seeded with sample tables | |
+| `analytics_engine` | A Cloudflare account's Workers Analytics Engine datasets, read-only | `cloudflare.account_id` and `cloudflare.api_token` (see [Workers Analytics Engine](#workers-analytics-engine)) |
 
-All three run the same SQLite backend: SQL passes straight through, DuckDB
-can browse, query, `CREATE TABLE … AS` and `INSERT`, and writes are atomic,
-including [transactions](#transactions).
+The first three run the same SQLite backend: SQL passes straight through,
+DuckDB can browse, query, `CREATE TABLE … AS` and `INSERT`, and writes are
+atomic, including [transactions](#transactions).
 
 ## How it works
 
@@ -48,6 +50,8 @@ including [transactions](#transactions).
   one from the client's options.
 - `src/grainlift-sql-object.ts`: the base class that makes your Durable
   Object class queryable; `src/example-room.ts` is an example.
+- `src/analytics-engine.ts`, `src/analytics-parameters.ts`: the
+  `analytics_engine` target, over the Analytics Engine SQL API.
 - `src/permissions.ts`: who may use which database (`PERMISSIONS`).
 - `src/oidc-auth.ts`: optional sign-in with any OpenID Connect provider.
 - `migrations/`: sample `countries` and `cities` tables (rounded figures).
@@ -133,6 +137,68 @@ dev`. The local URI is `grainlift+http://127.0.0.1:8787`. If every request
 fails with HTTP 500, the gateway could not start: `npx wrangler tail` (or the
 `npm run dev` output) says which setting is missing or invalid.
 
+## Workers Analytics Engine
+
+The `analytics_engine` target queries the datasets your Workers write with
+`writeDataPoint`, through the
+[SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
+Each dataset is a table with the same columns: `timestamp`, `dataset`,
+`index1`, `_sample_interval`, `blob1`…`blob20` (text) and `double1`…`double20`.
+It is read-only.
+
+Each client sends its Cloudflare account ID and an API token with
+**Account › Account Analytics › Read** (create one under My Profile › API
+Tokens) as database options, so Cloudflare applies that token's permissions:
+
+| Option | |
+|---|---|
+| `cloudflare.account_id` | The account's ID (32 hex digits) |
+| `cloudflare.api_token` | The API token. The gateway forwards it to Cloudflare and never logs or echoes it |
+
+The gateway can supply either instead, for clients that send none: the var
+`ANALYTICS_ENGINE_ACCOUNT_ID` and the secret `ANALYTICS_ENGINE_API_TOKEN`.
+A gateway token lets everyone granted the target read every dataset in that
+account, so prefer clients' own tokens on a shared gateway. Either way, grant
+the target in `PERMISSIONS` (`{"*": [{"target": "analytics_engine"}]}` lets
+every signed-in principal use it with their own token).
+
+```sql
+CREATE SECRET ae (TYPE adbc, DRIVER '/path/to/libadbc_driver_grainlift.dylib',
+  URI 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  SCOPE 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  EXTRA_OPTIONS MAP {'grainlift.target': 'analytics_engine', 'grainlift.auth.bearer_token': '…',
+    'cloudflare.account_id': '<account id>', 'cloudflare.api_token': '<API token>'});
+ATTACH 'https://grainlift-cloudflare.rusty-bb6.workers.dev' AS ae (TYPE adbc, SECRET 'ae');
+SELECT blob1, sum(_sample_interval) AS events
+FROM ae.my_dataset WHERE "timestamp" > now() - INTERVAL 7 DAY
+GROUP BY blob1 ORDER BY events DESC;
+```
+
+What to know:
+
+- **Results stream.** Rows arrive as JSON lines and become Arrow batches as
+  the client reads them, so a large result is never held whole; closing it
+  early stops the download. Each query costs two API calls: one to learn its
+  column types (`SELECT * FROM (query) LIMIT 0`), one to run it.
+- **The SQL is Analytics Engine's own**, a subset of ClickHouse's: one dataset
+  per query (no `JOIN` or `UNION`), its own function list (`count()`, not
+  `count(*)`), and no `FORMAT` clause (the gateway chooses the format). From
+  DuckDB, joins and the rest of SQL happen in DuckDB.
+- **Parameters are inlined.** The API takes no bound parameters, so each `?`
+  becomes a literal; this is how DuckDB's filters reach Analytics Engine. Text
+  may not contain `'` or `\` (Analytics Engine accepts neither in a literal,
+  so such a value is refused rather than escaped). Timestamps have whole
+  seconds there: a filter value with fractions of a second is rounded so the
+  comparison stays exact (`> 10.5` becomes `> 10`, `>= 10.5` becomes
+  `>= 11`), and is refused where no rounding is exact, such as `=`.
+- **Types:** integers (counts are `UInt64`) become int64, `Float64` float64,
+  `DateTime` a UTC timestamp, `Date` a date, and everything else text,
+  including a `DateTime` in another time zone.
+- **Sampling.** At high volume Analytics Engine samples events; weight counts
+  and sums by `_sample_interval` (`sum(_sample_interval)`, not `count()`).
+- **A dataset that does not exist** reads as empty, as the API answers it; the
+  catalog lists only datasets that do.
+
 ## Authentication
 
 A client proves who it is with a bearer token (`grainlift.auth.bearer_token`,
@@ -172,7 +238,7 @@ required, and a principal it does not name can use nothing.
 
 | Grant field | |
 |---|---|
-| `target` | `durable_object`, `d1`, `sqlite`, or `*` for all of them |
+| `target` | `durable_object`, `d1`, `sqlite`, `analytics_engine`, or `*` for all of them |
 | `namespace` | `durable_object` only: the binding name, or a prefix such as `TEAM_*`. Default: every listed namespace |
 | `object` | `durable_object` only: the object's name, or a prefix such as `team-a-*`. Objects chosen by id have no name, so only a grant without `object` (or `"*"`) covers them |
 | `database` | `d1` only: the binding name, or a prefix. Default: every listed database |
@@ -242,6 +308,10 @@ npx wrangler deploy --env public
 ```
 
 Set `READ_ONLY` to `"true"`, or grant `"access": "read"`, to refuse writes.
+Its grant names every target (`"*"`), so do not set the gateway's own
+Analytics Engine account and token there, or list the targets anonymous users
+may use instead: otherwise anyone could read your account's analytics.
+(Anonymous users can still query Analytics Engine with their own tokens.)
 
 ## Query your own Durable Objects
 

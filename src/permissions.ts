@@ -21,7 +21,8 @@ export type Access = "read" | "read_write";
 export type Resource =
   | { target: "sqlite" }
   | { target: "d1"; database: string }
-  | { target: "durable_object"; namespace: string; name?: string; id?: string };
+  | { target: "durable_object"; namespace: string; name?: string; id?: string }
+  | { target: "analytics_engine" };
 
 interface Grant {
   target: string;
@@ -36,6 +37,7 @@ const FIELDS: Record<string, readonly string[]> = {
   sqlite: [],
   d1: ["database"],
   durable_object: ["namespace", "object"],
+  analytics_engine: [],
 };
 
 export class Permissions {
@@ -120,6 +122,7 @@ function covers(grant: Grant, resource: Resource): boolean {
   if (grant.target !== resource.target) return false;
   switch (resource.target) {
     case "sqlite":
+    case "analytics_engine":
       return true;
     case "d1":
       return matches(grant.database, resource.database);

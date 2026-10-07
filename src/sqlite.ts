@@ -471,7 +471,7 @@ function checkLocation(catalog: string | null, dbSchema: string | null): void {
 }
 
 /** ADBC filters are SQL LIKE patterns (% and _); null matches everything. */
-function likeMatches(pattern: string | null, value: string): boolean {
+export function likeMatches(pattern: string | null, value: string): boolean {
   if (pattern === null) return true;
   const regex = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
   return new RegExp(`^${regex}$`, "is").test(value);
