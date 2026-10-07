@@ -1,19 +1,70 @@
-# Grainlift on Cloudflare Workers (D1)
+# Grainlift on Cloudflare Workers
 
-An ADBC gateway that serves a [Cloudflare D1](https://developers.cloudflare.com/d1/)
-database, written with the [Grainlift TypeScript SDK](https://github.com/Query-farm/grainlift-typescript)
-and running on Cloudflare Workers. Any ADBC client with the
-[Grainlift driver](https://github.com/Query-farm/grainlift) can query it. That
-includes DuckDB with the grainlift extension, in the browser through
-[Cupola](https://cupola.query-farm.services) too.
+An ADBC gateway for the data inside your Cloudflare account: your Workers'
+[Durable Objects](https://developers.cloudflare.com/durable-objects/), your
+[D1](https://developers.cloudflare.com/d1/) databases, and the events your
+Workers record in [Workers Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/). It is written
+with the [Grainlift TypeScript SDK](https://github.com/Query-farm/grainlift-typescript)
+and runs as a Worker. Any ADBC client with the
+[Grainlift driver](https://github.com/Query-farm/grainlift) can query and
+write them: Python, DuckDB (through `adbc_scanner`, or the grainlift
+extension), and the browser through [Cupola](https://cupola.query-farm.services).
 
 ```sql
-ATTACH 'grainlift+https://grainlift-d1-example.rusty-bb6.workers.dev' AS d1
+ATTACH 'grainlift+https://grainlift-cloudflare.rusty-bb6.workers.dev' AS d1
   (TYPE grainlift, target 'd1', bearer_token '…');
 SELECT k.continent, count(*) AS cities
 FROM d1.cities c JOIN d1.countries k ON c.country_code = k.code
 GROUP BY ALL;
 ```
+
+## Targets
+
+A client chooses a target, and within it a database, with ADBC options:
+
+| Target | Database | Chosen with |
+|---|---|---|
+| `durable_object` | One object of a Durable Object namespace bound to the gateway | `cloudflare.durable_object.namespace` and `.name` or `.id` (see [Query your own Durable Objects](#query-your-own-durable-objects)) |
+| `d1` | One D1 database bound to the gateway | `cloudflare.d1.database` (see [D1 databases](#d1-databases)) |
+| `sqlite` | The gateway's own Durable Object storage, seeded with sample tables | |
+| `analytics_engine` | A Cloudflare account's Workers Analytics Engine datasets, read-only | `cloudflare.account_id` and `cloudflare.api_token` (see [Workers Analytics Engine](#workers-analytics-engine)) |
+
+The first three run the same SQLite backend: SQL passes straight through,
+DuckDB can browse, query, `CREATE TABLE … AS` and `INSERT`, and writes are
+atomic, including [transactions](#transactions).
+
+### Public article playground
+
+The `public` deployment also has a `demo` target: one fixed `BlogDemo` Durable
+Object, separate from both the gateway's storage and the existing example rooms.
+It contains synthetic coffee-shop `products`, `orders`, `visitor_notes`, and
+`demo_info` tables. No credentials are needed:
+
+```sql
+ATTACH 'grainlift+https://grainlift-cloudflare-public.rusty-bb6.workers.dev'
+  AS shop (TYPE grainlift, target 'demo');
+SELECT * FROM shop.products;
+```
+
+[Open the same database in Cupola](https://cupola.query-farm.services/?service=grainlift%2Bhttps%3A%2F%2Fgrainlift-cloudflare-public.rusty-bb6.workers.dev&target=demo&name=shop).
+Readers share the data and may write to it. An alarm erases **all** of the
+object's storage and reseeds it every four hours (00:00, 04:00, 08:00, 12:00,
+16:00, 20:00 UTC), including removing visitor-created tables. `demo_info` reports
+the next reset. The scheduling deadline lives outside the SQL tables; editing
+that table does not change the alarm. Construction also recovers an overdue
+reset. Repeated alarm delivery within a cycle preserves new writes.
+
+`BLOG_DEMO` is bound only in `env.public`. It is not listed in
+`DURABLE_OBJECT_NAMESPACES`, and clients cannot choose a different object through
+the `demo` target. Its permission is the existing Durable Object grant for
+namespace `BLOG_DEMO`, object `playground`. Public sample data uses wildcard CORS
+so both query.farm and Cupola (and local previews) can connect.
+
+Run `npm run typecheck` and `npm run test:blog-demo` before
+`npx wrangler deploy --env public`. The latter test uses local workerd SQLite to
+verify initialization, persistence across restarts, alarm deadlines, full
+cleanup, reseeding, and repeated alarm delivery. Its test-only reset methods
+are never included in the deployed Worker.
 
 ## How it works
 
@@ -22,51 +73,266 @@ GROUP BY ALL;
   statements, open result streams) live in memory between requests, and a
   Durable Object is the one place on Workers where they reliably do. When the
   object is evicted after idling, its sessions end; the driver opens a new one
-  for the next query.
-- `src/sqlite.ts`: the backend, for any SQLite store. SQL passes straight
-  through. Tables, columns, primary keys and foreign keys come from
-  `sqlite_master` and the table pragmas, laid out like the ADBC SQLite
-  driver's (catalog `main`, one unnamed schema). ADBC bulk ingestion creates
-  and appends to tables, so DuckDB can `CREATE TABLE … AS` and `INSERT` through
-  `ATTACH`.
-- `src/stores.ts`: the two stores, one per target:
-  - `target 'd1'`: a Cloudflare D1 database.
-  - `target 'sqlite'`: the gateway Durable Object's own SQLite storage, seeded
-    with the sample tables on first start.
-- `src/google-auth.ts`: optional Google sign-in (see below).
+  for the next query (in autocommit mode).
+- `src/sqlite.ts`: the backend, for any SQLite store. Tables, columns, primary
+  keys and foreign keys come from `sqlite_master` and the table pragmas, laid
+  out like the ADBC SQLite driver's (catalog `main`, one unnamed schema). ADBC
+  bulk ingestion creates and appends to tables.
+- `src/stores.ts`: the stores: D1, the gateway's own storage, and other
+  Durable Objects over RPC. `src/durable-objects.ts` and `src/d1.ts` choose
+  one from the client's options.
+- `src/grainlift-sql-object.ts`: the base class that makes your Durable
+  Object class queryable; `src/example-room.ts` is an example.
+- `src/analytics-engine.ts`, `src/analytics-parameters.ts`: the
+  `analytics_engine` target, over the Analytics Engine SQL API.
+- `src/permissions.ts`: who may use which database (`PERMISSIONS`).
+- `src/oidc-auth.ts`: optional sign-in with any OpenID Connect provider.
 - `migrations/`: sample `countries` and `cities` tables (rounded figures).
 
 The SDK runs on Workers with [flechette](https://github.com/uwdata/flechette)
 as its Arrow implementation and needs the `nodejs_compat` flag.
 
-## Deploy your own
+## Deploy it for your own Workers
 
-```sh
-npm install
-npx wrangler d1 create grainlift-example     # put the database_id in wrangler.jsonc
-npm run db:migrate                           # sample tables
-openssl rand -hex 24 | tee .grainlift-token | npx wrangler secret put GRAINLIFT_TOKEN
-npm run deploy
+The gateway runs in your Cloudflare account, next to the Workers whose data it
+serves. Bindings are fixed when a Worker deploys, so you choose the namespaces
+and databases it reaches in `wrangler.jsonc`, then say who may use them.
+
+1. **Get the code.**
+
+   ```sh
+   git clone https://github.com/Query-farm/grainlift-cloudflare && cd grainlift-cloudflare
+   npm install
+   ```
+
+2. **Make your Durable Object classes queryable.** In your application's
+   Worker, copy `src/grainlift-sql-object.ts` and `src/durable-sql.ts`, and
+   extend `GrainliftSqlObject` instead of `DurableObject`
+   (see [Query your own Durable Objects](#query-your-own-durable-objects)).
+   Deploy your application. D1 databases need nothing.
+
+3. **Bind them to the gateway.** In `wrangler.jsonc`, set `name` and
+   `PUBLIC_URL` (`https://<name>.<your-subdomain>.workers.dev`), and replace the
+   example bindings with yours:
+
+   ```jsonc
+   "durable_objects": { "bindings": [
+     { "name": "GATEWAY", "class_name": "GrainliftGateway" },           // keep: the gateway itself
+     { "name": "CHATS", "class_name": "ChatRoom", "script_name": "chat-app" }
+   ] },
+   "d1_databases": [{ "binding": "ANALYTICS", "database_name": "analytics", "database_id": "…" }],
+   "vars": {
+     "DURABLE_OBJECT_NAMESPACES": "CHATS",
+     "D1_DATABASES": "ANALYTICS",
+     …
+   }
+   ```
+
+   The R2 bucket for large requests is optional: without `UPLOADS` and the
+   `UPLOAD_SIGNING_KEY` secret, requests are limited to `REQUEST_BYTES`.
+
+4. **Issue tokens**, one per person or program, as a secret mapping each
+   token to a principal name:
+
+   ```sh
+   echo "{\"$(openssl rand -hex 24)\": \"etl\", \"$(openssl rand -hex 24)\": \"analyst\"}" \
+     | tee .grainlift-tokens | npx wrangler secret put GRAINLIFT_TOKENS
+   ```
+
+   Or let people [sign in](#sign-in-with-openid-connect) with your identity
+   provider instead, or as well.
+
+5. **Say who may use what**, as the `PERMISSIONS` secret
+   (see [Permissions](#permissions)). The gateway refuses to start without it.
+
+   ```sh
+   echo '{"etl": [{"target": "*", "access": "read_write"}],
+          "analyst": [{"target": "d1", "database": "ANALYTICS"}]}' \
+     | npx wrangler secret put PERMISSIONS
+   ```
+
+6. **Deploy** with `npm run deploy`, and connect:
+
+   ```python
+   from adbc_driver_grainlift import dbapi
+   with dbapi.connect(db_kwargs={
+       "grainlift.uri": "https://<name>.<your-subdomain>.workers.dev",
+       "grainlift.target": "durable_object",
+       "grainlift.auth.bearer_token": "<the etl token>",
+       "cloudflare.durable_object.name": "general",
+   }) as conn:
+       ...
+   ```
+
+For local development, put `GRAINLIFT_TOKENS=…` (or `GRAINLIFT_TOKEN=…`) and
+`PERMISSIONS=…` in `.dev.vars` and run `npm run db:migrate:local && npm run
+dev`. The local URI is `grainlift+http://127.0.0.1:8787`. If every request
+fails with HTTP 500, the gateway could not start: `npx wrangler tail` (or the
+`npm run dev` output) says which setting is missing or invalid.
+
+## Workers Analytics Engine
+
+The `analytics_engine` target queries the datasets your Workers write with
+`writeDataPoint`, through the
+[SQL API](https://developers.cloudflare.com/analytics/analytics-engine/sql-api/).
+Each dataset is a table with the same columns: `timestamp`, `dataset`,
+`index1`, `_sample_interval`, `blob1`…`blob20` (text) and `double1`…`double20`.
+It is read-only.
+
+Each client sends its Cloudflare account ID and an API token with
+**Account › Account Analytics › Read** (create one under My Profile › API
+Tokens) as database options, so Cloudflare applies that token's permissions:
+
+| Option | |
+|---|---|
+| `cloudflare.account_id` | The account's ID (32 hex digits) |
+| `cloudflare.api_token` | The API token. The gateway forwards it to Cloudflare and never logs or echoes it |
+
+The gateway can supply either instead, for clients that send none: the var
+`ANALYTICS_ENGINE_ACCOUNT_ID` and the secret `ANALYTICS_ENGINE_API_TOKEN`.
+A gateway token lets everyone granted the target read every dataset in that
+account, so prefer clients' own tokens on a shared gateway. Either way, grant
+the target in `PERMISSIONS` (`{"*": [{"target": "analytics_engine"}]}` lets
+every signed-in principal use it with their own token).
+
+```sql
+CREATE SECRET ae (TYPE adbc, DRIVER '/path/to/libadbc_driver_grainlift.dylib',
+  URI 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  SCOPE 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  EXTRA_OPTIONS MAP {'grainlift.target': 'analytics_engine', 'grainlift.auth.bearer_token': '…',
+    'cloudflare.account_id': '<account id>', 'cloudflare.api_token': '<API token>'});
+ATTACH 'https://grainlift-cloudflare.rusty-bb6.workers.dev' AS ae (TYPE adbc, SECRET 'ae');
+SELECT blob1, sum(_sample_interval) AS events
+FROM ae.my_dataset WHERE "timestamp" > now() - INTERVAL 7 DAY
+GROUP BY blob1 ORDER BY events DESC;
 ```
 
-Set `PUBLIC_URL` (and `CORS_ORIGIN`, for a browser client) in
-`wrangler.jsonc`. For local development, put `GRAINLIFT_TOKEN=…` in `.dev.vars`
-and run `npm run db:migrate:local && npm run dev`. The local URI is then
-`grainlift+http://127.0.0.1:8787`.
+What to know:
+
+- **Results stream.** Rows arrive as JSON lines and become Arrow batches as
+  the client reads them, so a large result is never held whole; closing it
+  early stops the download. Each query costs two API calls: one to learn its
+  column types (`SELECT * FROM (query) LIMIT 0`), one to run it.
+- **The SQL is Analytics Engine's own**, a subset of ClickHouse's: one dataset
+  per query (no `JOIN` or `UNION`), its own function list (`count()`, not
+  `count(*)`), and no `FORMAT` clause (the gateway chooses the format). From
+  DuckDB, joins and the rest of SQL happen in DuckDB.
+- **Parameters are inlined.** The API takes no bound parameters, so each `?`
+  becomes a literal; this is how DuckDB's filters reach Analytics Engine. Text
+  may not contain `'` or `\` (Analytics Engine accepts neither in a literal,
+  so such a value is refused rather than escaped). Timestamps have whole
+  seconds there: a filter value with fractions of a second is rounded so the
+  comparison stays exact (`> 10.5` becomes `> 10`, `>= 10.5` becomes
+  `>= 11`), and is refused where no rounding is exact, such as `=`.
+- **Types:** integers (counts are `UInt64`) become int64, `Float64` float64,
+  `DateTime` a UTC timestamp, `Date` a date, and everything else text,
+  including a `DateTime` in another time zone.
+- **Sampling.** At high volume Analytics Engine samples events; weight counts
+  and sums by `_sample_interval` (`sum(_sample_interval)`, not `count()`).
+- **A dataset that does not exist** reads as empty, as the API answers it; the
+  catalog lists only datasets that do.
+
+## Authentication
+
+A client proves who it is with a bearer token (`grainlift.auth.bearer_token`,
+or `bearer_token` in DuckDB's `ATTACH`). Who it is decides nothing by itself:
+[Permissions](#permissions) do.
+
+- **Static tokens.** `GRAINLIFT_TOKENS` maps tokens (at least 24 characters)
+  to principals: `{"<token>": "etl"}`. Give each person or program its own,
+  so one can be revoked without the others. `GRAINLIFT_TOKEN` is a single
+  token for principal `token-user`, convenient for local development.
+- **[Sign-in with OpenID Connect](#sign-in-with-openid-connect)**: people use
+  their own accounts with Google, Okta, Auth0, Microsoft Entra ID or any
+  other OIDC provider. Their principal is their verified email.
+- **Anonymous.** With `ALLOW_ANONYMOUS = "true"`, requests without credentials
+  get principal `anonymous` (see [A public gateway](#a-public-gateway)).
+
+## Permissions
+
+`PERMISSIONS` is JSON mapping principals to the grants they hold. It is
+required, and a principal it does not name can use nothing.
+
+```json
+{
+  "etl":               [{ "target": "*", "access": "read_write" }],
+  "alice@example.com": [{ "target": "durable_object", "namespace": "CHATS", "object": "team-a-*", "access": "read_write" }],
+  "@example.com":      [{ "target": "d1", "database": "ANALYTICS" }],
+  "*":                 [{ "target": "sqlite" }]
+}
+```
+
+| Key | Matches |
+|---|---|
+| `etl`, `alice@example.com` | That principal (emails ignore case) |
+| `@example.com` | Every signed-in user with an email at that domain |
+| `*` | Every authenticated principal (not `anonymous`) |
+| `anonymous` | Clients without credentials, with `ALLOW_ANONYMOUS` |
+
+| Grant field | |
+|---|---|
+| `target` | `durable_object`, `d1`, `sqlite`, `analytics_engine`, or `*` for all of them |
+| `namespace` | `durable_object` only: the binding name, or a prefix such as `TEAM_*`. Default: every listed namespace |
+| `object` | `durable_object` only: the object's name, or a prefix such as `team-a-*`. Objects chosen by id have no name, so only a grant without `object` (or `"*"`) covers them |
+| `database` | `d1` only: the binding name, or a prefix. Default: every listed database |
+| `access` | `read` (the default) or `read_write` |
+
+A principal holds the strongest access any of its grants gives. Read access
+runs only statements that read (`SELECT`, `WITH`, `VALUES`, `EXPLAIN` with no
+write keyword) and refuses ingestion, updates and writes in transactions.
+`READ_ONLY = "true"` makes every grant read-only. A connection to a database
+the principal has no grant for is refused, as is a target it has no grant on.
+
+Keep `PERMISSIONS` a secret (`wrangler secret put`) when it names people.
+
+## Sign-in with OpenID Connect
+
+People can sign in with your identity provider: Cupola in the browser, and
+the Grainlift driver on the command line (through a browser, or the device
+flow on headless machines). The gateway publishes OAuth discovery (RFC 9728),
+so clients find the provider themselves. Clients send the provider's ID token,
+which the gateway verifies against the provider's published keys.
+
+1. Register an OAuth client with your provider, with redirect URIs
+   `https://<your-worker>/_oauth/callback` and, for Cupola,
+   `https://cupola.query-farm.services/oauth-callback.html` (and origin
+   `https://cupola.query-farm.services`).
+2. Set the vars `OIDC_ISSUER` and `OIDC_CLIENT_ID`, and if the provider
+   requires one, `npx wrangler secret put OIDC_CLIENT_SECRET`.
+3. Grant the users access in `PERMISSIONS`, by email or by domain, and deploy.
+
+| Provider | `OIDC_ISSUER` | Notes |
+|---|---|---|
+| Google | `https://accounts.google.com` | A **Web application** client; Google requires its secret. For the device flow, add a **TVs and Limited Input devices** client as `OIDC_DEVICE_CLIENT_ID` (secret: `OIDC_DEVICE_CLIENT_SECRET`). |
+| Okta | `https://<org>.okta.com` (or a custom authorization server's issuer) | A native or SPA app with PKCE needs no secret. |
+| Auth0 | `https://<tenant>.auth0.com/` | |
+| Microsoft Entra ID | `https://login.microsoftonline.com/<tenant-id>/v2.0` | Entra's ID tokens carry no `email_verified`; set `OIDC_PRINCIPAL_CLAIM` to `preferred_username` (or `oid`) and key `PERMISSIONS` by it. |
+
+The principal is the token's `email` claim, which must be verified
+(`email_verified`); `OIDC_PRINCIPAL_CLAIM` names another claim. For Google,
+an address at a domain other than `gmail.com` is accepted only from a
+Workspace account of that domain, so an `@example.com` key cannot be matched
+by a personal Google account that registered an `example.com` address.
+
+The client secret travels through the gateway's `/_oauth/token` proxy, and
+VGI-RPC also lists it in the OAuth metadata, so use a client whose secret is
+not confidential: Google's are not, and most other providers offer public
+clients with PKCE, which need none.
 
 ## A public gateway
 
 `wrangler.jsonc` also defines a `public` environment: the same gateway on its
-own copy of the data (a second D1 database), open to anyone without sign-in
-(`ALLOW_ANONYMOUS`), reads and writes alike. It is deployed at
-`https://grainlift-d1-public.rusty-bb6.workers.dev`:
+own copy of the data (a second D1 database), open to anyone without sign-in.
+`ALLOW_ANONYMOUS` admits requests without credentials, and its `PERMISSIONS`
+var grants `anonymous` read and write on every target. It is deployed at
+`https://grainlift-cloudflare-public.rusty-bb6.workers.dev`:
 
 ```sql
-ATTACH 'grainlift+https://grainlift-d1-public.rusty-bb6.workers.dev' AS d1 (TYPE grainlift, target 'd1');
+ATTACH 'grainlift+https://grainlift-cloudflare-public.rusty-bb6.workers.dev' AS d1 (TYPE grainlift, target 'd1');
 ```
 
 or in Cupola:
-<https://cupola.query-farm.services/?service=grainlift%2Bhttps://grainlift-d1-public.rusty-bb6.workers.dev&target=d1>
+<https://cupola.query-farm.services/?service=grainlift%2Bhttps://grainlift-cloudflare-public.rusty-bb6.workers.dev&target=d1>
 
 ```sh
 npx wrangler d1 create grainlift-example-public   # its database_id goes in env.public
@@ -74,39 +340,97 @@ npx wrangler d1 migrations apply grainlift-example-public --remote --env public
 npx wrangler deploy --env public
 ```
 
-Set `READ_ONLY` to `"true"` to refuse writes. D1 has no read-only
-connections, so that mode only runs statements that begin as reads (`SELECT`,
-`WITH`, `VALUES`, `EXPLAIN`) and contain no write keyword. It refuses
-ingestion and `execute_update` outright.
+Set `READ_ONLY` to `"true"`, or grant `"access": "read"`, to refuse writes.
+Its grant names every target (`"*"`), so do not set the gateway's own
+Analytics Engine account and token there, or list the targets anonymous users
+may use instead: otherwise anyone could read your account's analytics.
+(Anonymous users can still query Analytics Engine with their own tokens.)
 
-## Google sign-in
+## Query your own Durable Objects
 
-With Google configured, the gateway accepts Google ID tokens from allowed
-accounts. It publishes OAuth discovery (RFC 9728) so Cupola can sign users in,
-and the Grainlift driver can refresh their tokens. The static token keeps
-working alongside it.
+The `durable_object` target queries the SQLite storage of an application's
+Durable Objects: one object per connection, chosen by the client with ADBC
+database options.
 
-1. In the [Google Cloud console](https://console.cloud.google.com/apis/credentials),
-   create an OAuth client ID of type **Web application** with:
-   - Authorized JavaScript origins: `https://cupola.query-farm.services`
-   - Authorized redirect URIs: `https://cupola.query-farm.services/oauth-callback.html`
-     and `https://<your-worker>/_oauth/callback`
-2. In `wrangler.jsonc` `vars`, set `GOOGLE_CLIENT_ID`. Set `ALLOWED_EMAILS`
-   and/or `ALLOWED_DOMAINS` (comma-separated) as vars, or as secrets to keep the
-   list out of the repository (`npx wrangler secret put ALLOWED_EMAILS`).
-   Nobody else gets in.
-3. `npx wrangler secret put GOOGLE_CLIENT_SECRET`, then `npm run deploy`.
-4. For command-line sign-in (the Grainlift driver's device flow), create a
-   second client of type **TVs and Limited Input devices** in the same
-   project. Set `GOOGLE_DEVICE_CLIENT_ID` and
-   `npx wrangler secret put GOOGLE_DEVICE_CLIENT_SECRET`. The gateway accepts
-   ID tokens issued to either client.
+| Option | |
+|---|---|
+| `cloudflare.durable_object.namespace` | The namespace's binding name, such as `ROOMS`. Optional when the gateway lists only one. |
+| `cloudflare.durable_object.name` | The object's name, as `idFromName` takes it. |
+| `cloudflare.durable_object.id` | Or its id (64 hex digits), for objects made with `newUniqueId`. |
 
-Google's access tokens are opaque, so clients send the ID token
-(`use_id_token_as_bearer`). Google requires the client secret even for PKCE.
-Token requests therefore go through the gateway's `/_oauth/token` proxy,
-which adds it. As with VGI services, VGI-RPC also lists the secret in the
-OAuth metadata.
+```python
+from adbc_driver_grainlift import dbapi
+
+with dbapi.connect(db_kwargs={
+    "grainlift.uri": "https://grainlift-cloudflare.rusty-bb6.workers.dev",
+    "grainlift.target": "durable_object",
+    "grainlift.auth.bearer_token": "…",
+    "cloudflare.durable_object.namespace": "ROOMS",
+    "cloudflare.durable_object.name": "lobby",
+}) as conn, conn.cursor() as cur:
+    cur.execute("SELECT author, body FROM messages")
+```
+
+From DuckDB, pass them as `EXTRA_OPTIONS` of an `adbc_scanner` secret:
+
+```sql
+CREATE SECRET lobby (TYPE adbc, DRIVER '/path/to/libadbc_driver_grainlift.dylib',
+  URI 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  SCOPE 'https://grainlift-cloudflare.rusty-bb6.workers.dev',
+  EXTRA_OPTIONS MAP {'grainlift.target': 'durable_object', 'grainlift.auth.bearer_token': '…',
+    'cloudflare.durable_object.namespace': 'ROOMS', 'cloudflare.durable_object.name': 'lobby'});
+ATTACH 'https://grainlift-cloudflare.rusty-bb6.workers.dev' AS lobby (TYPE adbc, SECRET 'lobby', READ_WRITE);
+SELECT * FROM lobby.messages;
+CREATE TABLE lobby.cities AS SELECT * FROM 'cities.parquet';   -- writes work too (see Transactions)
+```
+
+A Durable Object's storage is private to the object, so the object runs the
+gateway's SQL itself, over Durable Object RPC. To make a class queryable:
+
+1. Extend `GrainliftSqlObject` (`src/grainlift-sql-object.ts`) instead of
+   `DurableObject`. It adds three RPC methods, `grainliftRows`,
+   `grainliftObjects` and `grainliftWrite`, and needs nothing from Grainlift.
+   A class with another base can add the three methods itself and delegate to
+   `src/durable-sql.ts`.
+2. Bind the namespace to the gateway in `wrangler.jsonc`. For a class in
+   another Worker of the same account, add its `script_name`:
+   `{ "name": "ROOMS", "class_name": "ChatRoom", "script_name": "chat-app" }`.
+3. List the binding in `DURABLE_OBJECT_NAMESPACES` (comma-separated). The
+   gateway refuses any namespace not listed there.
+
+`src/example-room.ts` is an example: a chat room keeping its messages in its
+own storage, bound as `ROOMS`. Every room is a separate object with a separate
+database, created on first use.
+
+Writes go through the object too, each one a single `transactionSync`, so
+they are atomic. Workers RPC limits one call to 32 MiB, so a write is refused
+above about 30 MiB, and a query's whole result must fit as well (results are
+read in one call).
+
+A principal with access to an object can run any SQL in it, bypassing the
+application's own logic. Grant access by namespace and object-name prefix
+(see [Permissions](#permissions)), and list in `DURABLE_OBJECT_NAMESPACES`
+only namespaces whose data someone should reach this way.
+
+## D1 databases
+
+The `d1` target serves the D1 databases bound to the gateway that
+`D1_DATABASES` lists (comma-separated binding names; by default `DB`, the
+example's database). A client chooses one with `cloudflare.d1.database`, which
+may be left out when only one is listed:
+
+```python
+dbapi.connect(db_kwargs={
+    "grainlift.uri": "https://grainlift-cloudflare.rusty-bb6.workers.dev",
+    "grainlift.target": "d1",
+    "grainlift.auth.bearer_token": "…",
+    "cloudflare.d1.database": "ANALYTICS",
+})
+```
+
+To add a database, bind it in `wrangler.jsonc` (`d1_databases`) and add its
+binding name to `D1_DATABASES`. A Worker reaches only the D1 databases bound
+to it, so each one needs a binding and a deploy.
 
 ## Writes are atomic per statement
 
@@ -147,8 +471,33 @@ Add a lifecycle rule to the bucket to delete objects after a day; nothing else
 removes them. `CORS_ORIGIN` also applies to `/_uploads/`, so a browser client
 can PUT and GET there.
 
-Neither store keeps a transaction open across requests, so DuckDB's
-`BEGIN … COMMIT` around several writes is refused.
+## Transactions
+
+With autocommit off, the default in Python's DB-API and what DuckDB's
+`adbc_scanner` uses around every write (`CREATE TABLE … AS`, `INSERT`, and
+`BEGIN … COMMIT`), a connection holds a transaction. No store can keep one
+open across requests: Durable Object SQLite only has `transactionSync`, which
+finishes within one call, and D1 only has `batch()`. So the gateway collects
+the transaction's writes and `commit` sends them as one atomic write;
+`rollback` discards them. All of it lands, or none of it.
+
+Two differences from a database transaction:
+
+- **Errors arrive at `commit`.** A constraint violation, a SQL mistake in a
+  write, or a store limit (D1's queries per request) is reported by `commit`,
+  and nothing in the transaction is written.
+- **Reads see only committed data,** not the transaction's pending writes.
+  A write with `RETURNING` is refused in a transaction, since it has no result
+  until commit; turn autocommit on to use it.
+
+A transaction holds at most 64 MiB of pending writes. They live in the
+gateway Durable Object's memory with the rest of the session, and every
+request reaches that one object, so a connection's writes are never split
+across instances. If the session ends first (idle for `idleMs`, two minutes
+here, or the object restarted by eviction or a deploy), its pending writes are
+gone, as in a rollback, and `commit` fails with "Session is unavailable": the
+Grainlift driver replaces a lost session only in autocommit mode, so a
+transaction is never silently reported as committed.
 
 ## Limitations
 

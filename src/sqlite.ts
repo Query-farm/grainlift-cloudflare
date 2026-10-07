@@ -18,6 +18,7 @@ import {
   int64,
   type ObjectFilters,
   type OpenOptions,
+  type OptionKind,
   type OptionValue,
   type QueryResult,
   type RecordBatch,
@@ -43,14 +44,12 @@ const DB_SCHEMA = "";
 const ROWS_PER_BATCH = 4096;
 /** Bound parameters per statement: D1's limit, and Durable Object SQLite's. */
 const MAX_PARAMETERS = 100;
+/** Most bytes of SQL and parameters one transaction may collect before commit. */
+const MAX_TRANSACTION_BYTES = 64 * 2 ** 20;
+const AUTOCOMMIT = "adbc.connection.autocommit";
 
-export type SqlValue = string | number | null | ArrayBuffer;
-
-/** One statement of an atomic write. */
-export interface SqlWrite {
-  sql: string;
-  params: SqlValue[];
-}
+import type { SqlValue, SqlWrite } from "./durable-sql";
+export type { SqlValue, SqlWrite };
 
 /** Where the SQLite database lives. */
 export interface SqlStore {
@@ -70,40 +69,135 @@ export interface SqlStore {
 const TypeId = { Int: 2, Float: 3, Binary: 4, Utf8: 5, Bool: 6, Decimal: 7, Date: 8, Timestamp: 10 } as const;
 
 export interface SqliteOptions {
-  /** Refuse writes: for a gateway anyone may query. */
+  /** Refuse writes: the principal may only read. */
   readOnly?: boolean;
 }
 
+/** The store a connection uses, and whether it may only read. */
+export interface OpenedStore {
+  store: SqlStore;
+  readOnly: boolean;
+}
+
+/**
+ * Chooses a target's store when a client connects: from its database options
+ * (such as which Durable Object to query) and its principal's permissions.
+ */
+export type StoreSource = (options: OpenOptions) => OpenedStore;
+
 /** Serves each target from its store; unknown targets are refused. */
 export class SqliteWorker implements Worker {
-  constructor(
-    private readonly stores: ReadonlyMap<string, SqlStore>,
-    private readonly options: SqliteOptions = {},
-  ) {}
+  constructor(private readonly stores: ReadonlyMap<string, StoreSource>) {}
   async open(options: OpenOptions): Promise<Connection> {
-    const store = this.stores.get(options.target);
-    if (!store) throw new AdbcError(`Unknown target ${options.target}`, "not_found");
-    return new SqliteConnection(store, this.options);
+    const source = this.stores.get(options.target);
+    if (!source) throw new AdbcError(`Unknown target ${options.target}`, "not_found");
+    const { store, readOnly } = source(options);
+    return new SqliteConnection(new Session(store, { readOnly }));
+  }
+}
+
+/**
+ * One connection's store, options and transaction, shared with its statements.
+ *
+ * No store keeps a transaction open across requests: Durable Object SQLite
+ * only has `transactionSync`, which must finish within one call, and D1 only
+ * has `batch()`. So with autocommit off, writes are collected here instead of
+ * run, and `commit` sends them all as one atomic write. A transaction is then
+ * as atomic as one would be on the database, with two differences: an error
+ * such as a constraint violation is reported by `commit`, and a read inside
+ * the transaction does not see its pending writes.
+ */
+class Session {
+  /** The pending writes, with autocommit off; null with it on. */
+  private pending: SqlWrite[] | null = null;
+  private pendingBytes = 0;
+
+  constructor(
+    readonly store: SqlStore,
+    readonly options: SqliteOptions,
+  ) {}
+
+  get inTransaction(): boolean {
+    return this.pending !== null;
+  }
+
+  /** Run `statements` atomically now, or add them to the open transaction. */
+  async write(statements: SqlWrite[]): Promise<number | null> {
+    if (this.pending === null) return this.store.write(statements);
+    const bytes = statements.reduce((n, s) => n + s.sql.length + s.params.reduce<number>((m, p) => m + paramBytes(p), 0), 0);
+    if (this.pendingBytes + bytes > MAX_TRANSACTION_BYTES) {
+      throw new AdbcError(
+        `This transaction would hold more than ${MAX_TRANSACTION_BYTES / 2 ** 20} MiB of writes, which are kept ` +
+          "until commit; commit it in smaller parts",
+        "invalid_arguments",
+      );
+    }
+    this.pending.push(...statements);
+    this.pendingBytes += bytes;
+    return null;
+  }
+
+  begin(): void {
+    this.pending ??= [];
+  }
+
+  /** Send the pending writes as one atomic write; the transaction stays open for more. */
+  async commit(): Promise<void> {
+    if (this.pending === null) throw new AdbcError("Autocommit is on; there is no transaction to commit", "invalid_state");
+    const statements = this.pending;
+    this.pending = [];
+    this.pendingBytes = 0;
+    // On failure nothing was written: the whole transaction is rolled back.
+    if (statements.length) await this.store.write(statements);
+  }
+
+  rollback(): void {
+    if (this.pending === null) throw new AdbcError("Autocommit is on; there is no transaction to roll back", "invalid_state");
+    this.pending = [];
+    this.pendingBytes = 0;
+  }
+
+  /** Turn autocommit back on, committing the open transaction first. */
+  async end(): Promise<void> {
+    if (this.pending === null) return;
+    await this.commit();
+    this.pending = null;
   }
 }
 
 class SqliteConnection extends Connection {
-  constructor(
-    private readonly store: SqlStore,
-    private readonly options: SqliteOptions,
-  ) {
+  override statisticsSupported(): boolean { return false; }
+  override statisticNamesSupported(): boolean { return false; }
+  private readonly store: SqlStore;
+
+  constructor(private readonly session: Session) {
     super();
+    this.store = session.store;
   }
 
   override async newStatement(): Promise<Statement> {
-    return new SqliteStatement(this.store, this.options);
+    return new SqliteStatement(this.session);
   }
 
-  // No transaction stays open across requests (neither store allows one), so
-  // every statement autocommits; each one is atomic on its own.
+  /** Autocommit off opens a transaction (see Session); back on commits it. */
   override async setOption(key: string, value: OptionValue): Promise<void> {
-    if (key === "adbc.connection.autocommit" && value === "true") return;
+    if (key === AUTOCOMMIT && value === "true") return this.session.end();
+    if (key === AUTOCOMMIT && value === "false") return this.session.begin();
+    if (key === AUTOCOMMIT) throw new AdbcError(`${AUTOCOMMIT} must be "true" or "false"`, "invalid_arguments");
     throw new AdbcError(`${key} is not supported by ${this.store.name}`, "not_implemented");
+  }
+
+  override async getOption(key: string, kind: OptionKind): Promise<OptionValue> {
+    if (key === AUTOCOMMIT && kind === "string") return String(!this.session.inTransaction);
+    throw new AdbcError(`${key} is not known`, "not_found");
+  }
+
+  override async commit(): Promise<void> {
+    return this.session.commit();
+  }
+
+  override async rollback(): Promise<void> {
+    this.session.rollback();
   }
 
   override async getTableTypes(): Promise<QueryResult> {
@@ -139,7 +233,8 @@ class SqliteConnection extends Connection {
     const results = await this.store.objects<{ name: string; type: string }>(
       `SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')
          AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\'
-         AND name NOT LIKE 'd1\\_%' ESCAPE '\\' ORDER BY name`,
+         AND name NOT LIKE 'd1\\_%' ESCAPE '\\'
+         AND name NOT LIKE '\\_\\_miniflare\\_%' ESCAPE '\\' ORDER BY name`,
       [],
     );
     const rows: TableRow[] = [];
@@ -226,11 +321,13 @@ class SqliteStatement extends Statement {
   private bound: { schema: Schema; rows: SqlValue[][] } | null = null;
   private readonly ingest = new Map<string, string>();
 
-  constructor(
-    private readonly store: SqlStore,
-    private readonly options: SqliteOptions,
-  ) {
+  private readonly store: SqlStore;
+  private readonly options: SqliteOptions;
+
+  constructor(private readonly session: Session) {
     super();
+    this.store = session.store;
+    this.options = session.options;
   }
 
   override async setSqlQuery(sql: string): Promise<void> {
@@ -260,7 +357,16 @@ class SqliteStatement extends Statement {
     if (this.options.readOnly) refuseWrites(this.query());
     const rows = this.bound?.rows ?? [[]];
     if (rows.length !== 1) throw new AdbcError("Queries take at most one row of parameters", "invalid_arguments");
-    const { columns, rows: values } = await this.store.rows(this.query(), rows[0]!);
+    const sql = this.query();
+    // In a transaction a write waits for commit, so it has no result yet.
+    if (this.session.inTransaction && !isRead(sql)) {
+      if (/\breturning\b/i.test(sql))
+        throw new AdbcError("RETURNING needs autocommit on: writes in a transaction run at commit", "not_implemented");
+      checkRowSizes(this.store, rows);
+      await this.session.write([{ sql, params: rows[0]! }]);
+      return queryResult([], []);
+    }
+    const { columns, rows: values } = await this.store.rows(sql, rows[0]!);
     return queryResult(columns, values);
   }
 
@@ -269,13 +375,15 @@ class SqliteStatement extends Statement {
   }
 
   override async executeUpdate(): Promise<bigint | null> {
-    if (this.options.readOnly) throw new AdbcError("This gateway is read-only", "unauthorized");
+    if (this.options.readOnly) throw new AdbcError(`Read-only access to ${this.store.name}`, "unauthorized");
     if (this.bound) checkRowSizes(this.store, this.bound.rows);
     if (this.ingest.has("adbc.ingest.target_table")) return this.ingestBound();
-    // One statement per row of parameters, all in one transaction.
+    // One statement per row of parameters, all in one transaction. In an open
+    // transaction the count is unknown until commit.
     const sql = this.query();
     const rows = this.bound?.rows ?? [[]];
-    return BigInt(await this.store.write(rows.map((params) => ({ sql, params }))));
+    const changed = await this.session.write(rows.map((params) => ({ sql, params })));
+    return changed === null ? null : BigInt(changed);
   }
 
   /**
@@ -311,7 +419,7 @@ class SqliteStatement extends Statement {
     }
     // The transaction inserted every row or none; per-statement change counts
     // can be stale after DROP/CREATE, so report the rows themselves.
-    await this.store.write(statements);
+    await this.session.write(statements);
     return BigInt(rows.length);
   }
 
@@ -324,14 +432,19 @@ class SqliteStatement extends Statement {
 // ----- helpers ---------------------------------------------------------------
 
 /**
- * D1 has no read-only connections, so a read-only gateway only runs queries
+ * Neither store has read-only connections, so read-only access only runs queries
  * that start as reads and name no statement that writes. Conservative: a
  * write keyword anywhere (even inside a string) is refused.
  */
 function refuseWrites(sql: string): void {
+  if (!isRead(sql)) throw new AdbcError("Read-only access: only queries that read are allowed", "unauthorized");
+}
+
+/** Whether `sql` only reads: it starts as a read and names no statement that writes. */
+function isRead(sql: string): boolean {
   const reads = /^\s*(select|with|values|explain)\b/i.test(sql);
   const writes = /\b(insert|update|delete|replace|create|drop|alter|attach|detach|pragma|vacuum|reindex|analyze)\b/i.test(sql);
-  if (!reads || writes) throw new AdbcError("This gateway is read-only", "unauthorized");
+  return reads && !writes;
 }
 
 function result(value: Schema, batches: RecordBatch[]): QueryResult {
@@ -360,7 +473,7 @@ function checkLocation(catalog: string | null, dbSchema: string | null): void {
 }
 
 /** ADBC filters are SQL LIKE patterns (% and _); null matches everything. */
-function likeMatches(pattern: string | null, value: string): boolean {
+export function likeMatches(pattern: string | null, value: string): boolean {
   if (pattern === null) return true;
   const regex = pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/%/g, ".*").replace(/_/g, ".");
   return new RegExp(`^${regex}$`, "is").test(value);

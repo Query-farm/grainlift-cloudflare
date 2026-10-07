@@ -1,8 +1,11 @@
 // Copyright (c) 2026 Query Farm LLC
 // SPDX-License-Identifier: Apache-2.0
 
-// The two places the gateway keeps a SQLite database.
+// The places the gateway reaches a SQLite database: D1, its own Durable
+// Object storage, and other Durable Objects (over RPC).
 import { AdbcError, type Status } from "@query-farm/grainlift";
+import { sqlObjects, sqlRows, sqlWrite } from "./durable-sql";
+import type { GrainliftSqlObject } from "./grainlift-sql-object";
 import { paramBytes, type SqlStore, type SqlValue, type SqlWrite } from "./sqlite";
 
 /**
@@ -42,12 +45,13 @@ const MAX_D1_BATCH_BYTES = 30 * 2 ** 20;
  * as a whole must serialize to at most 32 MiB.
  */
 export class D1Store implements SqlStore {
-  readonly name = "D1";
   readonly maxRowBytes = MAX_ROW_BYTES;
 
   constructor(
     private readonly db: D1Database,
     private readonly maxQueries = 1000,
+    /** For messages: "D1", or with several databases, `D1 ANALYTICS`. */
+    readonly name = "D1",
   ) {}
 
   async rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }> {
@@ -100,28 +104,71 @@ export class DurableSqlStore implements SqlStore {
   constructor(private readonly storage: DurableObjectStorage) {}
 
   async rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }> {
-    return surfaced(this.name, () => {
-      const cursor = this.storage.sql.exec(sql, ...params);
-      const rows = [...cursor.raw()];
-      return { columns: cursor.columnNames, rows };
-    });
+    return surfaced(this.name, () => sqlRows(this.storage, sql, params));
   }
 
   async objects<T>(sql: string, params: SqlValue[]): Promise<T[]> {
-    return surfaced(this.name, () => this.storage.sql.exec(sql, ...params).toArray() as T[]);
+    return surfaced(this.name, () => sqlObjects(this.storage, sql, params) as T[]);
   }
 
   async write(statements: SqlWrite[]): Promise<number> {
-    const sql = this.storage.sql;
-    // total_changes() counts rows changed by INSERT/UPDATE/DELETE only, so DDL
-    // in the batch does not distort the count (changes() would be stale).
-    const total = () => Number(sql.exec("SELECT total_changes() AS n").one().n);
-    return surfaced(this.name, () =>
-      this.storage.transactionSync(() => {
-        const before = total();
-        for (const statement of statements) sql.exec(statement.sql, ...statement.params);
-        return total() - before;
-      }),
-    );
+    return surfaced(this.name, () => sqlWrite(this.storage, statements));
+  }
+}
+
+/** Below Workers RPC's 32 MiB limit on one call's serialized arguments, for overhead. */
+const MAX_RPC_BYTES = 30 * 2 ** 20;
+
+/**
+ * Another Durable Object's SQLite storage, which only that object can reach:
+ * its class extends GrainliftSqlObject, and the object runs each query, and
+ * each write as one `transactionSync`, over Durable Object RPC.
+ */
+export class DurableObjectStore implements SqlStore {
+  readonly maxRowBytes = MAX_ROW_BYTES;
+
+  constructor(
+    /** For messages: the namespace and the object, such as `ROOMS "lobby"`. */
+    readonly name: string,
+    private readonly stub: DurableObjectStub<GrainliftSqlObject>,
+  ) {}
+
+  async rows(sql: string, params: SqlValue[]): Promise<{ columns: string[]; rows: unknown[][] }> {
+    return this.call(async () => (await this.stub.grainliftRows(sql, params)) as { columns: string[]; rows: unknown[][] });
+  }
+
+  async objects<T>(sql: string, params: SqlValue[]): Promise<T[]> {
+    return this.call(async () => (await this.stub.grainliftObjects(sql, params)) as T[]);
+  }
+
+  async write(statements: SqlWrite[]): Promise<number> {
+    if (!statements.length) return 0;
+    const bytes = statements.reduce((n, s) => n + s.sql.length + s.params.reduce<number>((m, p) => m + paramBytes(p), 0), 0);
+    if (bytes > MAX_RPC_BYTES) {
+      throw new AdbcError(
+        `This write is about ${Math.round(bytes / 2 ** 20)} MiB; a Durable Object accepts at most 32 MiB in one ` +
+          "call, so insert it in smaller parts",
+        "invalid_arguments",
+      );
+    }
+    return this.call(async () => Number(await this.stub.grainliftWrite(statements)));
+  }
+
+  /** Errors cross RPC as plain Errors; name the object, and explain a class without the methods. */
+  private call<T>(action: () => Promise<T>): Promise<T> {
+    return surfaced(this.name, async () => {
+      try {
+        return await action();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/does not (implement|have) (the )?method|is not a function|grainlift(Rows|Objects|Write)/i.test(message)) {
+          throw new AdbcError(
+            `${this.name}: its class does not expose Grainlift SQL; extend GrainliftSqlObject (src/grainlift-sql-object.ts)`,
+            "not_implemented",
+          );
+        }
+        throw error;
+      }
+    });
   }
 }
